@@ -1,5 +1,3 @@
-
-
 #pragma once
 
 class TypeInfo;
@@ -7,11 +5,168 @@ class FieldInfo;
 
 DWORD_PTR FindPattern(DWORD_PTR dwAddress, DWORD_PTR dwLen, DWORD_PTR offset, bool deref, BYTE *bMask, char * szMask);
 
+/// Safely copy N bytes from an address. Returns false on fault.
+inline bool SafeReadBytes(uintptr_t addr, void* dst, size_t count)
+{
+	__try
+	{
+		memcpy(dst, (void*)addr, count);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// ============================================================================
+// Module & Pointer Helpers
+// ============================================================================
+
+inline void GetGameModuleInfo(uintptr_t& base, size_t& size)
+{
+	HMODULE hMod = GetModuleHandle(NULL);
+	base = (uintptr_t)hMod;
+	PIMAGE_DOS_HEADER dosHeader = (PIMAGE_DOS_HEADER)hMod;
+	PIMAGE_NT_HEADERS ntHeaders = (PIMAGE_NT_HEADERS)(base + dosHeader->e_lfanew);
+	size = ntHeaders->OptionalHeader.SizeOfImage;
+}
+
+inline bool IsValidPointer(void* ptr)
+{
+	return ptr != nullptr
+		&& (uintptr_t)ptr > 0x10000
+		&& (uintptr_t)ptr < 0x00007FFFFFFFFFFF;
+}
+
+// ============================================================================
+// SEH-Safe Memory Read Helpers
+// Standalone functions with no C++ objects, so MSVC allows __try/__except.
+// ============================================================================
+
+/// Safely read a pointer from the given address. Returns nullptr on fault.
+inline void* SafeReadPointer(uintptr_t addr)
+{
+	__try
+	{
+		if (!IsValidPointer((void*)addr)) return nullptr;
+		void* val = *(void**)addr;
+		return val;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+/// Safely read a float from the given address. Returns 0.0f on fault.
+inline float SafeReadFloat(uintptr_t addr)
+{
+	__try
+	{
+		if (!IsValidPointer((void*)addr)) return 0.0f;
+		return *(float*)addr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0.0f; }
+}
+
+/// Safely read a 32-bit int from the given address. Returns 0 on fault.
+inline int SafeReadInt32(uintptr_t addr)
+{
+	__try
+	{
+		if (!IsValidPointer((void*)addr)) return 0;
+		return *(int*)addr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/// Safely read a 32-bit unsigned int. Returns 0 on fault.
+inline unsigned int SafeReadUInt32(uintptr_t addr)
+{
+	__try
+	{
+		if (!IsValidPointer((void*)addr)) return 0;
+		return *(unsigned int*)addr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/// Safely read a bool. Returns false on fault.
+inline bool SafeReadBool(uintptr_t addr)
+{
+	__try
+	{
+		if (!IsValidPointer((void*)addr)) return false;
+		return *(bool*)addr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+/// Safely read a double. Returns 0.0 on fault.
+inline double SafeReadDouble(uintptr_t addr)
+{
+	__try
+	{
+		if (!IsValidPointer((void*)addr)) return 0.0;
+		return *(double*)addr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0.0; }
+}
+
+/// Check if a pointer targets the module's code/data region.
+inline bool IsModulePointer(void* ptr, uintptr_t modBase, uintptr_t modEnd)
+{
+	uintptr_t addr = (uintptr_t)ptr;
+	return addr >= modBase && addr < modEnd;
+}
+
+/// Safely count vtable entries starting from an object's vtable pointer.
+/// Walks forward until a non-module pointer is hit (max 256 entries).
+inline int SafeCountVTableEntries(void* instance, uintptr_t modBase, uintptr_t modEnd)
+{
+	__try
+	{
+		if (!IsValidPointer(instance)) return 0;
+		void** vtable = *(void***)instance;
+		if (!IsValidPointer(vtable)) return 0;
+
+		int count = 0;
+		while (count < 256)
+		{
+			void* entry = vtable[count];
+			if (!IsValidPointer(entry)) break;
+			uintptr_t addr = (uintptr_t)entry;
+			if (addr < modBase || addr >= modEnd) break;
+			count++;
+		}
+		return count;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+/// Safely read a vtable entry at a given index. Returns 0 on fault.
+inline uintptr_t SafeReadVTableEntry(void* instance, int index)
+{
+	__try
+	{
+		if (!IsValidPointer(instance)) return 0;
+		void** vtable = *(void***)instance;
+		if (!IsValidPointer(vtable)) return 0;
+		void* entry = vtable[index];
+		if (!IsValidPointer(entry)) return 0;
+		return (uintptr_t)entry;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// ============================================================================
+// Frostbite Type Flags
+// ============================================================================
+
 enum kTypes
 {
 	kType_Pointer = 53,
 	kType_Array = 65
 };
+
+// ============================================================================
+// ClassInfo
+// ============================================================================
 
 class ClassInfo
 {
@@ -34,7 +189,7 @@ public:
 			DWORD_PTR dwOffset2 = (dwMatch + 7);
 
 			instance = (ClassInfo**)(dwOffset + dwOffset2);
-			Log("Instance found at 0x%016llX", instance );
+			Log("Instance found at 0x%016llX", instance);
 		}
 		return *instance;
 	}
@@ -50,6 +205,10 @@ public:
 	char pad_0x002C[0x94]; //0x002C
 
 };//Size=0x00C0
+
+// ============================================================================
+// TypeInfo
+// ============================================================================
 
 class TypeInfo
 {
@@ -69,23 +228,27 @@ public:
 
 };//Size=0x0038
 
+// ============================================================================
+// Member / Field descriptors
+// ============================================================================
+
 class MemberInfoFlags
 {
 public:
-	unsigned short flagBits;                     // this+0x0
+	unsigned short flagBits;
 	enum
 	{
-		kMemberTypeMask = 0x3,                    // constant 0x3
-		kTypeCategoryShift = 0x2,                  // constant 0x2
-		kTypeCategoryMask = 0x3,                     // constant 0x3
-		kTypeCodeShift = 0x4,            // constant 0x4
-		kTypeCodeMask = 0x1F,                     // constant 0x1F
-		kMetadata = 0x800,                   // constant 0x800
-		kHomogeneous = 0x1000,                     // constant 0x1000
-		kAlwaysPersist = 0x2000,                     // constant 0x2000
-		kExposed = 0x2000,                     // constant 0x2000
-		kLayoutImmutable = 0x4000,                    // constant 0x4000
-		kBlittable = 0xFFFF8000                     // constant 0xFFFF8000
+		kMemberTypeMask = 0x3,
+		kTypeCategoryShift = 0x2,
+		kTypeCategoryMask = 0x3,
+		kTypeCodeShift = 0x4,
+		kTypeCodeMask = 0x1F,
+		kMetadata = 0x800,
+		kHomogeneous = 0x1000,
+		kAlwaysPersist = 0x2000,
+		kExposed = 0x2000,
+		kLayoutImmutable = 0x4000,
+		kBlittable = 0xFFFF8000
 	};
 };
 
@@ -140,3 +303,18 @@ public:
 	__int32 value;
 	char pad2[0x4];
 };
+inline bool SafeReadString(uintptr_t addr, char* dst, size_t maxLen)
+{
+	__try 
+	{
+		for (size_t i = 0; i < maxLen - 1; i++)
+		{
+			char c = *(char*)(addr + i);
+			dst[i] = c;
+			if (c == 0) return true;
+		}
+		dst[maxLen - 1] = 0;
+		return true;
+	}
+	__except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}

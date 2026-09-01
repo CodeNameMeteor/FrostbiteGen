@@ -1,6 +1,3 @@
-
-
-
 #include "required.h"
 #include "structs.h"
 #include "classinfo.h"
@@ -11,10 +8,6 @@ char g_szBaseDir[MAX_PATH];
 /// <summary>
 /// Datas the compare.
 /// </summary>
-/// <param name="pData">The p data.</param>
-/// <param name="bMask">The b mask.</param>
-/// <param name="szMask">The sz mask.</param>
-/// <returns></returns>
 bool DataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)
 {
 	for (int i = 0; *szMask; ++szMask, ++pData, ++bMask)
@@ -30,13 +23,6 @@ bool DataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)
 /// <summary>
 /// Finds the pattern.
 /// </summary>
-/// <param name="dwAddress">The dw address.</param>
-/// <param name="dwLen">Length of the dw.</param>
-/// <param name="offset">The offset.</param>
-/// <param name="deref">if set to <c>true</c> [deref].</param>
-/// <param name="bMask">The b mask.</param>
-/// <param name="szMask">The sz mask.</param>
-/// <returns></returns>
 DWORD_PTR FindPattern(DWORD_PTR dwAddress, DWORD_PTR dwLen, DWORD_PTR offset, bool deref, BYTE *bMask, char * szMask)
 {
 	for (DWORD_PTR i = 0; i < dwLen; i++)
@@ -58,8 +44,6 @@ DWORD_PTR FindPattern(DWORD_PTR dwAddress, DWORD_PTR dwLen, DWORD_PTR offset, bo
 /// <summary>
 /// Logs the specified sz text.
 /// </summary>
-/// <param name="szText">The sz text.</param>
-/// <param name="">The .</param>
 void Log(const char* szText, ...)
 {
 	va_list		va_alist;
@@ -94,21 +78,14 @@ void Log(const char* szText, ...)
 /// <summary>
 /// Gets the dir file.
 /// </summary>
-/// <param name="file">The file.</param>
-/// <param name="out">The out.</param>
-/// <param name="len">The length.</param>
 void GetDirFile(const char* file, char* out, size_t len)
 {
 	snprintf(out, len, "%s%s", g_szBaseDir, file);
 }
 
 /// <summary>
-/// DLLs the main.
+/// DLL entry point.
 /// </summary>
-/// <param name="hinstDLL">The hinst DLL.</param>
-/// <param name="fdwReason">The FDW reason.</param>
-/// <param name="lpvReserved">The LPV reserved.</param>
-/// <returns></returns>
 BOOL WINAPI DllMain(
 	_In_ HINSTANCE hinstDLL,
 	_In_ DWORD     fdwReason,
@@ -136,6 +113,9 @@ BOOL WINAPI DllMain(
 		fout.open(g_szLogFile, std::ios::trunc);
 		fout.close();
 
+		Log("FrostbiteGen SDK Generator starting...");
+		Log("Module base: 0x%016llX", (uintptr_t)GetModuleHandle(NULL));
+
 		char sdkPath[MAX_PATH];
 
 		GetDirFile("SDK\\", sdkPath, sizeof(sdkPath));
@@ -143,29 +123,22 @@ BOOL WINAPI DllMain(
 		if (dwAttr == INVALID_FILE_ATTRIBUTES)
 			CreateDirectory(sdkPath, NULL);
 
-#if 0
-		// todo: sort into different directories?
-		// you will have to resolve the include paths correctly though depending on what type they are
-		GetDirFile("SDK\\classes\\", sdkPath, sizeof(sdkPath));
-		dwAttr = GetFileAttributes(sdkPath);
-		if (dwAttr == INVALID_FILE_ATTRIBUTES)
-			CreateDirectory(sdkPath, NULL);
-
-		GetDirFile("SDK\\enums\\", sdkPath, sizeof(sdkPath));
-		dwAttr = GetFileAttributes(sdkPath);
-		if (dwAttr == INVALID_FILE_ATTRIBUTES)
-			CreateDirectory(sdkPath, NULL);
-#endif
-
 		ClassInfo* classInfo = ClassInfo::GetInstance();
 		if (!classInfo)
+		{
+			Log("ERROR: Failed to find ClassInfo instance");
+			MessageBox(0, "Failed to find ClassInfo", "FrostbiteGen", MB_ICONERROR);
 			return FALSE;
+		}
+
+		Log("ClassInfo head: 0x%016llX", (uintptr_t)classInfo);
 
 		ClassInfoManager manager(classInfo);
 		manager.BuildClassList();
 		manager.DumpClasses();
 
-		MessageBox(0, "success", 0, 0);
+		Log("SDK generation complete!");
+		MessageBox(0, "SDK generated successfully!\nCheck the SDK\\ folder for output.", "FrostbiteGen", MB_ICONINFORMATION);
 	}
 
 	return 0;

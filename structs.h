@@ -97,6 +97,17 @@ inline bool SafeReadBool(uintptr_t addr)
 	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+/// Safely read a 16-bit unsigned int. Returns 0 on fault.
+inline unsigned short SafeReadUInt16(uintptr_t addr)
+{
+	__try
+	{
+		if (!IsValidPointer((void*)addr)) return 0;
+		return *(unsigned short*)addr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
 /// Safely read a double. Returns 0.0 on fault.
 inline double SafeReadDouble(uintptr_t addr)
 {
@@ -176,7 +187,10 @@ public:
 		static ClassInfo** instance = NULL;
 		if (!instance)
 		{
-			DWORD_PTR dwMatch = FindPattern((DWORD_PTR)GetModuleHandle(NULL), -1, 0, false, (BYTE*)"\x48\x8B\x05\x00\x00\x00\x00\x48\x89\x41\x08\x48\x89\x0D\x00\x00\x00\x00\xC3", "xxx????xxxxxxx????x");
+			uintptr_t modBase;
+			size_t modSize;
+			GetGameModuleInfo(modBase, modSize);
+			DWORD_PTR dwMatch = FindPattern((DWORD_PTR)modBase, (DWORD_PTR)modSize, 0, false, (BYTE*)"\x48\x8B\x05\x00\x00\x00\x00\x48\x89\x41\x08\x48\x89\x0D\x00\x00\x00\x00\xC3", "xxx????xxxxxxx????x");
 			if (!dwMatch)
 				return NULL;
 
@@ -202,6 +216,7 @@ public:
 	ClassInfo* parent; //0x0018 
 	char pad_0x0020[0x8]; //0x0020
 	unsigned short id3; //0x0028 
+	char pad_0x002A[0x2]; //0x002A
 	char pad_0x002C[0x94]; //0x002C
 
 };//Size=0x00C0
@@ -270,20 +285,22 @@ class FieldInfo
 public:
 	int GetFieldSize()
 	{
-		if (!typeInfo)
-			return 0;
-		TypeInfo* ti = typeInfo->typeInfo;
-		switch (ti->flags)
-		{
-		case kType_Pointer:
-			return 8;
-			
-		case kType_Array:
-			return 8;
+		__try {
+			if (!IsValidPointer(typeInfo)) return 0;
+			TypeInfo* ti = typeInfo->typeInfo;
+			if (!IsValidPointer(ti)) return 0;
+			switch (ti->flags)
+			{
+			case kType_Pointer:
+				return 8;
+				
+			case kType_Array:
+				return 8;
 
-		default:
-			return ti->totalSize;
-		}
+			default:
+				return ti->totalSize;
+			}
+		} __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 	}
 
 	char* name;
@@ -310,8 +327,24 @@ inline bool SafeReadString(uintptr_t addr, char* dst, size_t maxLen)
 		for (size_t i = 0; i < maxLen - 1; i++)
 		{
 			char c = *(char*)(addr + i);
+			
+			if (c == 0) 
+			{
+				dst[i] = 0;
+				// An empty string is probably invalid for a name, but technically read correctly.
+				// However, if i == 0, we can let it return true and the caller handles empty strings.
+				return true;
+			}
+			
+			// If it's not a printable ASCII character, this is likely a garbage pointer.
+			// Reject the string completely.
+			if (c < 32 || c > 126)
+			{
+				dst[0] = 0;
+				return false;
+			}
+			
 			dst[i] = c;
-			if (c == 0) return true;
 		}
 		dst[maxLen - 1] = 0;
 		return true;

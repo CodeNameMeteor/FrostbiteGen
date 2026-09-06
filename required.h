@@ -10,7 +10,6 @@
 #include <map>
 #include <string>
 #include <fstream>
-#include <time.h>
 #include <iostream>
 #include <functional>
 #include <algorithm>
@@ -18,9 +17,9 @@
 #include <cstdint>
 #include <sstream>
 #include <set>
+#include <cctype>
 
 void Log(const char* szText, ...);
 void GetDirFile(const char* file, char* out, size_t len);
 
 #endif
-#include <cctype>

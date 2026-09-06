@@ -50,9 +50,9 @@ private:
 	void	DumpClass(ClassInfo* c);
 	int		DumpClassMembers(std::ofstream& file, std::vector<FieldInfo*>& members, int parentSize);
 	void	ParseClassMembers(TypeInfo* ti, std::vector<FieldInfo*>& members);
-	char*	GetFixedClassName(const char* orig);
+	const char*	GetFixedClassName(const char* orig);
 	std::string GetSanitizedClassName(const char* orig);
-	void	ResolveHeaders(std::vector<FieldInfo*> members, std::ofstream& file);
+	void	ResolveHeaders(const std::vector<FieldInfo*>& members, std::ofstream& file);
 
 	void	DumpEnum(ClassInfo* c);
 	void	DumpEnumMembers(std::ofstream& file, TypeInfo* ti);
@@ -139,6 +139,10 @@ private:
 	void GenerateSDKMasterHeader();
 	void GenerateForwardDeclarations();
 	void GenerateBonusOutputs();
+	
+	// --- P4: Additional Bonus Outputs ---
+	void GenerateReClassProject();
+	void GenerateCheatEngineTable();
 
 private:
 	ClassInfo* m_listHead;

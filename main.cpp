@@ -10,14 +10,14 @@ char g_szBaseDir[MAX_PATH];
 /// </summary>
 bool DataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)
 {
-	for (int i = 0; *szMask; ++szMask, ++pData, ++bMask)
+	for (; *szMask; ++szMask, ++pData, ++bMask)
 	{
 		if (*szMask == 'x' && *pData != *bMask)
 		{
 			return false;
 		}
 	}
-	return (*szMask) == NULL;
+	return *szMask == '\0';
 }
 
 /// <summary>
@@ -31,8 +31,11 @@ DWORD_PTR FindPattern(DWORD_PTR dwAddress, DWORD_PTR dwLen, DWORD_PTR offset, bo
 		{
 			if (deref)
 			{
+				void* derefAddr = *(void**)(dwAddress + i + offset);
+				if (!derefAddr)
+					return 0;
 				DWORD_PTR dwOut;
-				memcpy(&dwOut, *(void**)(dwAddress + i + offset), 4);
+				memcpy(&dwOut, derefAddr, 4);
 				return dwOut;
 			}
 			return (DWORD_PTR)(dwAddress + i + offset);
@@ -63,13 +66,13 @@ void Log(const char* szText, ...)
 	}
 
 	time_t rawtime;
-	struct tm * ti;
+	struct tm ti;
 
 	time(&rawtime);
-	ti = localtime(&rawtime);
+	localtime_s(&ti, &rawtime);
 
 	char szTime[64];
-	sprintf(szTime, "[%02d:%02d:%02d] ", ti->tm_hour, ti->tm_min, ti->tm_sec);
+	snprintf(szTime, sizeof(szTime), "[%02d:%02d:%02d] ", ti.tm_hour, ti.tm_min, ti.tm_sec);
 
 	fout << szTime << buf << std::endl;
 	fout.close();
@@ -107,7 +110,7 @@ BOOL WINAPI DllMain(
 				}
 			}
 		}
-		sprintf(g_szLogFile, "%sfbgen.txt", g_szBaseDir);
+		snprintf(g_szLogFile, sizeof(g_szLogFile), "%sfbgen.txt", g_szBaseDir);
 
 		std::ofstream fout;
 		fout.open(g_szLogFile, std::ios::trunc);

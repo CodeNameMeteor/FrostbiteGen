@@ -1,4 +1,4 @@
-#include "classinfo.h"
+﻿#include "classinfo.h"
 
 // ============================================================================
 // Constructor
@@ -20,15 +20,15 @@ ClassInfoManager::ClassInfoManager(ClassInfo* info) :
 // Class List & Dump Entry Points
 // ============================================================================
 
-static bool CheckValidPtr(void* ptr) {
-	return ptr != nullptr && (uintptr_t)ptr > 0x10000 && (uintptr_t)ptr < 0x00007FFFFFFFFFFF;
-}
-
 void ClassInfoManager::BuildClassList()
 {
 	ClassInfo* c = m_listHead;
+	std::set<ClassInfo*> visited;
 	while (c != NULL)
 	{
+		if (visited.count(c))
+			break; // cycle detected
+		visited.insert(c);
 		if (c->typeInfo && c->typeInfo->name)
 		{
 			m_classMap[c->typeInfo->name] = c;
@@ -92,35 +92,31 @@ void ClassInfoManager::DumpClasses()
 
 		if (contextCI)
 		{
-			// Known class ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â use field-based traversal
+			// Known class - use field-based traversal
 			BuildTraversalMap(m_clientGameCtxInstance, contextCI, 0, rootChain, visited);
 		}
 		else if (m_clientGameCtxInstance)
 		{
 			Log("  Root class unknown by name. Attempting vtable identification...");
 			ClassInfo* identifiedRoot = TryIdentifyClassByVTable(m_clientGameCtxInstance, true);
-			
-			std::vector<TraversalStep> chain;
-			std::set<uintptr_t> visited;
-			visited.insert(m_clientGameCtxInstance);
 
 			if (identifiedRoot && identifiedRoot->typeInfo && identifiedRoot->typeInfo->name)
 			{
 				std::string targetName = identifiedRoot->typeInfo->name;
 				Log("  -> Identified Root Class: %s! Switching to standard traversal.", targetName.c_str());
 
-				TraversalChain rootChain;
-				rootChain.targetClass = targetName;
-				rootChain.steps = chain;
-				rootChain.resolvedAddress = m_clientGameCtxInstance;
-				m_traversalMap[targetName] = rootChain;
+				TraversalChain identifiedRootChain;
+				identifiedRootChain.targetClass = targetName;
+				identifiedRootChain.steps = rootChain;
+				identifiedRootChain.resolvedAddress = m_clientGameCtxInstance;
+				m_traversalMap[targetName] = identifiedRootChain;
 
-				BuildTraversalMap(m_clientGameCtxInstance, identifiedRoot, 1, chain, visited);
+				BuildTraversalMap(m_clientGameCtxInstance, identifiedRoot, 1, rootChain, visited);
 			}
 			else
 			{
 				Log("  -> Root class still unknown, using blind traversal fallback...");
-				BlindTraversalWalk(m_clientGameCtxInstance, 0, chain, visited);
+				BlindTraversalWalk(m_clientGameCtxInstance, 0, rootChain, visited);
 			}
 		}
 
@@ -128,7 +124,7 @@ void ClassInfoManager::DumpClasses()
 	}
 	else
 	{
-		Log("WARNING: Root singleton not found ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â instance resolution will be limited");
+		Log("WARNING: Root singleton not found - instance resolution will be limited");
 	}
 
 	// Phase 1.5: Scan globals for singletons
@@ -186,6 +182,7 @@ void ClassInfoManager::GenerateBonusOutputs()
 	__try { GenerateGhidraScript(); } __except(1) { Log("Crash in GenerateGhidraScript"); }
 	__try { GenerateCrossRefFile(); } __except(1) { Log("Crash in GenerateCrossRefFile"); }
 	__try { DumpLiveInstances(); } __except(1) { Log("Crash in DumpLiveInstances"); }
+	__try { GenerateCheatEngineTable(); } __except(1) { Log("Crash in GenerateCheatEngineTable"); }
 }
 
 // ============================================================================
@@ -250,7 +247,7 @@ uintptr_t ClassInfoManager::FindClientGameContext()
 
 	// ----------------------------------------------------------------
 	// Step 1: Find the game-context class in our class map.
-	//         Try many name variants ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â the root may not be called
+	//         Try many name variants - the root may not be called
 	//         "ClientGameContext" in all FB3 games.
 	// ----------------------------------------------------------------
 	const char* candidateNames[] = {
@@ -317,7 +314,7 @@ uintptr_t ClassInfoManager::FindClientGameContext()
 	}
 	else
 	{
-		Log("  No exact name match ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â will use brute-force to find root singleton");
+		Log("  No exact name match - will use brute-force to find root singleton");
 	}
 
 	// Default scan range for sub-pointer validation
@@ -419,7 +416,7 @@ uintptr_t ClassInfoManager::FindClientGameContext()
 	}
 
 	// ----------------------------------------------------------------
-	// Step 3: Brute-force ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â scan the .data section for global pointers
+	// Step 3: Brute-force - scan the .data section for global pointers
 	//         that hold objects with many valid sub-pointers.
 	// ----------------------------------------------------------------
 	Log("  Pattern scan failed, trying brute-force global pointer scan...");
@@ -755,7 +752,7 @@ void ClassInfoManager::DumpClass(ClassInfo* c)
 
 	std::string sanitizedName = GetSanitizedClassName(c->typeInfo->name);
 	char headerFile[128], headerPath[MAX_PATH];
-	sprintf(headerFile, "SDK\\%s.h", sanitizedName.c_str());
+	snprintf(headerFile, sizeof(headerFile), "SDK\\%s.h", sanitizedName.c_str());
 	GetDirFile(headerFile, headerPath, sizeof(headerPath));
 
 	std::ofstream file;
@@ -816,7 +813,7 @@ void ClassInfoManager::DumpClass(ClassInfo* c)
 
 	int memberSize = DumpClassMembers(file, members, totalSizeOfParents);
 	if (memberSize + totalSizeOfParents < totalSizeOfClass)
-		file << "\tunsigned char _0x" << std::hex << (memberSize + totalSizeOfParents) << "[0x" << std::hex << (totalSizeOfClass - (memberSize + totalSizeOfParents)) << "];" << std::endl;
+		file << "\tunsigned char _0x" << std::hex << (memberSize + totalSizeOfParents) << "[0x" << std::hex << (totalSizeOfClass - (memberSize + totalSizeOfParents)) << "];" << std::dec << std::endl;
 
 	// --- Getter/Setter Accessors ---
 	file << std::endl;
@@ -825,7 +822,7 @@ void ClassInfoManager::DumpClass(ClassInfo* c)
 	// --- VMT Hook Helper ---
 	DumpVMTHookHelper(c, file);
 
-	file << "}; // size = 0x" << std::hex << totalSizeOfClass << std::endl << std::endl;
+	file << "}; // size = 0x" << std::hex << totalSizeOfClass << std::dec << std::endl << std::endl;
 	file << "#endif // FBGEN_" << c->typeInfo->name << "_H" << std::endl;
 
 	file.close();
@@ -843,7 +840,7 @@ void ClassInfoManager::DumpStruct(ClassInfo* c)
 
 	std::string sanitizedName = GetSanitizedClassName(c->typeInfo->name);
 	char headerFile[128], headerPath[MAX_PATH];
-	sprintf(headerFile, "SDK\\%s.h", sanitizedName.c_str());
+	snprintf(headerFile, sizeof(headerFile), "SDK\\%s.h", sanitizedName.c_str());
 	GetDirFile(headerFile, headerPath, sizeof(headerPath));
 
 	std::ofstream file;
@@ -872,12 +869,12 @@ void ClassInfoManager::DumpStruct(ClassInfo* c)
 	int totalSizeOfClass = ti->totalSize;
 	int memberSize = DumpClassMembers(file, members, 0);
 	if (memberSize < totalSizeOfClass)
-		file << "\tunsigned char _0x" << std::hex << memberSize << "[0x" << std::hex << (totalSizeOfClass - memberSize) << "];" << std::endl;
+		file << "\tunsigned char _0x" << std::hex << memberSize << "[0x" << std::hex << (totalSizeOfClass - memberSize) << "];" << std::dec << std::endl;
 
 	file << std::endl;
 	DumpGetterSetters(file, members, ti);
 
-	file << "}; // size = 0x" << std::hex << totalSizeOfClass << std::endl << std::endl;
+	file << "}; // size = 0x" << std::hex << totalSizeOfClass << std::dec << std::endl << std::endl;
 	file << "#endif // FBGEN_" << c->typeInfo->name << "_H" << std::endl;
 
 	file.close();
@@ -894,7 +891,7 @@ void ClassInfoManager::DumpEnum(ClassInfo* c)
 
 	std::string sanitizedName = GetSanitizedClassName(c->typeInfo->name);
 	char headerFile[128], headerPath[MAX_PATH];
-	sprintf(headerFile, "SDK\\%s.h", sanitizedName.c_str());
+	snprintf(headerFile, sizeof(headerFile), "SDK\\%s.h", sanitizedName.c_str());
 	GetDirFile(headerFile, headerPath, sizeof(headerPath));
 
 	std::ofstream file;
@@ -931,32 +928,23 @@ void ClassInfoManager::DumpEnumMembers(std::ofstream& file, TypeInfo* ti)
 // Member Parsing & Dumping (unchanged)
 // ============================================================================
 
-void ClassInfoManager::ResolveHeaders(std::vector<FieldInfo*> members, std::ofstream& file)
+void ClassInfoManager::ResolveHeaders(const std::vector<FieldInfo*>& members, std::ofstream& file)
 {
-	for (unsigned int i = 0; i < members.size(); ++i)
+	std::set<std::string> emittedTypes;
+	for (int i = 0; i < (int)members.size(); ++i)
 	{
-		FieldInfo* v1 = members.at(i);
-		for (unsigned int j = 0; j < members.size(); ++j)
-		{
-			FieldInfo* v2 = members.at(j);
-			if (v1 == v2) continue;
-			if (!strcmp(v1->typeInfo->typeInfo->name, v2->typeInfo->typeInfo->name))
-			{
-				members.erase(members.begin() + i);
-				i--;
-				break;
-			}
-		}
-	}
-	for (auto m : members)
-	{
-		const char* tn = m->typeInfo->typeInfo->name;
+		FieldInfo* fi = members.at(i);
+		const char* tn = fi->typeInfo->typeInfo->name;
+		if (emittedTypes.count(tn))
+			continue;
+		emittedTypes.insert(tn);
+
 		if (!strcmp(tn, "Boolean") || !strcmp(tn, "Float32") || !strcmp(tn, "Float64") ||
 			!strcmp(tn, "Int8") || !strcmp(tn, "Int16") || !strcmp(tn, "Int32") || !strcmp(tn, "Int64") ||
 			!strcmp(tn, "Uint8") || !strcmp(tn, "Uint16") || !strcmp(tn, "Uint32") || !strcmp(tn, "Uint64") ||
 			!strcmp(tn, "CString"))
 			continue;
-		if (m->typeInfo->typeInfo->flags == kType_Array)
+		if (fi->typeInfo->typeInfo->flags == kType_Array)
 		{
 			file << "#include \"Array.h\"" << std::endl;
 			continue;
@@ -965,12 +953,12 @@ void ClassInfoManager::ResolveHeaders(std::vector<FieldInfo*> members, std::ofst
 	}
 }
 
-char* ClassInfoManager::GetFixedClassName(const char* orig)
+const char* ClassInfoManager::GetFixedClassName(const char* orig)
 {
-	if (!orig || !IsValidPointer((void*)orig)) return (char*)"unk";
-	if (!strcmp(orig, "Boolean"))   return (char*)"bool";
-	if (!strcmp(orig, "Float32"))   return (char*)"float";
-	if (!strcmp(orig, "Float64"))   return (char*)"double";
+	if (!orig || !IsValidPointer((void*)orig)) return "unk";
+	if (!strcmp(orig, "Boolean"))   return "bool";
+	if (!strcmp(orig, "Float32"))   return "float";
+	if (!strcmp(orig, "Float64"))   return "double";
 	if (!strcmp(orig, "Int8"))      return "char";
 	if (!strcmp(orig, "Int16"))     return "short";
 	if (!strcmp(orig, "Int32"))     return "int";
@@ -980,16 +968,27 @@ char* ClassInfoManager::GetFixedClassName(const char* orig)
 	if (!strcmp(orig, "Uint32"))    return "unsigned int";
 	if (!strcmp(orig, "Uint64"))    return "unsigned long";
 	if (!strcmp(orig, "CString"))   return "const char*";
-	return (char*)orig;
+	return orig;
+}
+
+bool SafeValidateFieldInfo(FieldInfo* fi)
+{
+	__try {
+		if (!fi || !fi->typeInfo || !fi->typeInfo->typeInfo) return false;
+		return true;
+	} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 void ClassInfoManager::ParseClassMembers(TypeInfo* ti, std::vector<FieldInfo*>& members)
 {
-	for (int i = 0; i < ti->fieldCount; ++i)
+	if (!IsValidPointer(ti) || !IsValidPointer(ti->fields)) return;
+	int fieldCount = SafeReadUInt16((uintptr_t)&ti->fieldCount);
+	if (fieldCount <= 0 || fieldCount > 10000) return;
+	for (int i = 0; i < fieldCount; ++i)
 	{
 		FieldInfo* fi = &ti->fields[i];
-		if (!fi || !fi->typeInfo || !fi->typeInfo->typeInfo) continue;
-		members.push_back(fi);
+		if (SafeValidateFieldInfo(fi))
+			members.push_back(fi);
 	}
 	auto cmp = [](const FieldInfo* a, const FieldInfo* b) { return a->offset < b->offset; };
 	std::sort(members.begin(), members.end(), cmp);
@@ -997,11 +996,14 @@ void ClassInfoManager::ParseClassMembers(TypeInfo* ti, std::vector<FieldInfo*>& 
 
 void ClassInfoManager::ParseStructMembers(TypeInfo* ti, std::vector<FieldInfo*>& members)
 {
-	for (int i = 0; i < ti->fieldCount; ++i)
+	if (!IsValidPointer(ti) || !IsValidPointer(ti->structFields)) return;
+	int fieldCount = SafeReadUInt16((uintptr_t)&ti->fieldCount);
+	if (fieldCount <= 0 || fieldCount > 10000) return;
+	for (int i = 0; i < fieldCount; ++i)
 	{
 		FieldInfo* fi = &ti->structFields[i];
-		if (!fi || !fi->typeInfo || !fi->typeInfo->typeInfo) continue;
-		members.push_back(fi);
+		if (SafeValidateFieldInfo(fi))
+			members.push_back(fi);
 	}
 	auto cmp = [](const FieldInfo* a, const FieldInfo* b) { return a->offset < b->offset; };
 	std::sort(members.begin(), members.end(), cmp);
@@ -1017,19 +1019,22 @@ int ClassInfoManager::DumpClassMembers(std::ofstream& file, std::vector<FieldInf
 		FieldInfo* fi = members.at(i);
 		if (fi->offset > lastOffset)
 		{
-			file << "\tunsigned char _0x" << std::hex << lastOffset << "[0x" << std::hex << (fi->offset - lastOffset) << "];" << std::endl;
+			file << "\tunsigned char _0x" << std::hex << lastOffset << "[0x" << std::hex << (fi->offset - lastOffset) << "];" << std::dec << std::endl;
 			totalSize += fi->offset - lastOffset;
 		}
 		lastOffset = fi->offset + fi->GetFieldSize();
 
 		MemberTypeInfo* fti = fi->typeInfo;
+		if (!IsValidPointer(fti)) continue;
 		TypeInfo* mti = fti->typeInfo;
+		if (!IsValidPointer(mti)) continue;
 
 		if (mti->flags == kType_Pointer)
 			file << "\t" << GetFixedClassName(mti->name) << "* m_" << fi->name << "; // 0x" << std::hex << fi->offset << std::endl;
 		else if (mti->flags == kType_Array)
 		{
-			TypeInfo* ati = *(TypeInfo**)mti->enumFields;
+			TypeInfo* ati = (mti->enumFields && IsValidPointer(mti->enumFields)) ? *(TypeInfo**)mti->enumFields : nullptr;
+			if (!IsValidPointer(ati)) continue;
 			if (ati->flags == kType_Pointer)
 				file << "\tArray<" << GetFixedClassName(ati->name) << "*> m_" << fi->name << "; // 0x" << std::hex << fi->offset << std::endl;
 			else
@@ -1046,20 +1051,21 @@ int ClassInfoManager::DumpClassMembers(std::ofstream& file, std::vector<FieldInf
 std::vector<ClassInfo*> ClassInfoManager::GetParents(ClassInfo* c)
 {
 	std::vector<ClassInfo*> parents;
+	std::set<ClassInfo*> visited;
+	visited.insert(c);
 	ClassInfo* p = c->parent;
-	ClassInfo* lastP = c;
 	while (p)
 	{
-		if (p == lastP) break;
+		if (visited.count(p)) break; // cycle detected
+		visited.insert(p);
 		parents.push_back(p);
-		lastP = p;
 		p = p->parent;
 	}
 	return parents;
 }
 
 // ============================================================================
-// Type Info (ASLR-safe ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â unchanged)
+// Type Info (ASLR-safe - unchanged)
 // ============================================================================
 
 void ClassInfoManager::DumpTypeInfo(ClassInfo* c, std::ofstream& file)
@@ -1072,7 +1078,7 @@ void ClassInfoManager::DumpTypeInfo(ClassInfo* c, std::ofstream& file)
 }
 
 // ============================================================================
-// P0: Instance Resolver (rewritten ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ClientGameContext traversal)
+// P0: Instance Resolver (rewritten - ClientGameContext traversal)
 // ============================================================================
 
 void ClassInfoManager::DumpInstanceResolver(ClassInfo* c, std::ofstream& file)
@@ -1092,8 +1098,8 @@ void ClassInfoManager::DumpInstanceResolver(ClassInfo* c, std::ofstream& file)
 	}
 	else if (className == "ClientGameContext" && m_clientGameCtxGlobalOffset != 0)
 	{
-		// Special case: ClientGameContext is the root ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â resolve directly from global ptr
-		file << "\t\t// Root singleton ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â resolved via pattern scan" << std::endl;
+		// Special case: ClientGameContext is the root - resolve directly from global ptr
+		file << "\t\t// Root singleton - resolved via pattern scan" << std::endl;
 		file << "\t\tuintptr_t pCtx = fb::Read<uintptr_t>(fb::GetModuleBase() + 0x"
 			<< std::hex << m_clientGameCtxGlobalOffset << ");" << std::endl;
 		file << "\t\tif (!pCtx) return nullptr;" << std::endl;
@@ -1129,7 +1135,7 @@ void ClassInfoManager::DumpInstanceResolver(ClassInfo* c, std::ofstream& file)
 		}
 		else
 		{
-			// Not found in traversal ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â emit stub
+			// Not found in traversal - emit stub
 			file << "\t\t// WARNING: No traversal chain found from ClientGameContext." << std::endl;
 			file << "\t\t// This class was not reachable during SDK generation." << std::endl;
 			file << "\t\t// Use fb::PatternScan() or manual pointer chains to resolve." << std::endl;
@@ -1178,7 +1184,7 @@ void ClassInfoManager::DumpDefaultValues(ClassInfo* c, std::ofstream& file,
 	std::string className = c->typeInfo->name;
 	auto it = m_traversalMap.find(className);
 	if (it == m_traversalMap.end())
-		return; // no live instance ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â can't snapshot
+		return; // no live instance - can't snapshot
 
 	uintptr_t instanceAddr = it->second.resolvedAddress;
 	if (!instanceAddr)
@@ -1189,7 +1195,9 @@ void ClassInfoManager::DumpDefaultValues(ClassInfo* c, std::ofstream& file,
 	for (auto fi : members)
 	{
 		MemberTypeInfo* fti = fi->typeInfo;
+		if (!IsValidPointer(fti)) continue;
 		TypeInfo* mti = fti->typeInfo;
+		if (!IsValidPointer(mti)) continue;
 		const char* fixedName = GetFixedClassName(mti->name);
 		uintptr_t fieldAddr = instanceAddr + fi->offset;
 
@@ -1204,22 +1212,42 @@ void ClassInfoManager::DumpDefaultValues(ClassInfo* c, std::ofstream& file,
 			float val = SafeReadFloat(fieldAddr);
 			file << "\t\tstatic constexpr float " << fi->name << " = " << std::defaultfloat << val << "f;" << std::endl;
 		}
-		else if (!strcmp(fixedName, "int") || !strcmp(fixedName, "short") || !strcmp(fixedName, "char"))
+		else if (!strcmp(fixedName, "int"))
 		{
 			int val = SafeReadInt32(fieldAddr);
 			file << "\t\tstatic constexpr int " << fi->name << " = " << std::dec << val << ";" << std::endl;
 		}
-		else if (!strcmp(fixedName, "unsigned int") || !strcmp(fixedName, "unsigned short") || !strcmp(fixedName, "unsigned char"))
+		else if (!strcmp(fixedName, "short"))
+		{
+			short val = (short)SafeReadUInt16(fieldAddr);
+			file << "\t\tstatic constexpr short " << fi->name << " = " << std::dec << val << ";" << std::endl;
+		}
+		else if (!strcmp(fixedName, "char"))
+		{
+			char val = (char)(SafeReadUInt16(fieldAddr) & 0xFF);
+			file << "\t\tstatic constexpr char " << fi->name << " = " << std::dec << (int)val << ";" << std::endl;
+		}
+		else if (!strcmp(fixedName, "unsigned int"))
 		{
 			unsigned int val = SafeReadUInt32(fieldAddr);
 			file << "\t\tstatic constexpr unsigned int " << fi->name << " = " << std::dec << val << ";" << std::endl;
+		}
+		else if (!strcmp(fixedName, "unsigned short"))
+		{
+			unsigned short val = SafeReadUInt16(fieldAddr);
+			file << "\t\tstatic constexpr unsigned short " << fi->name << " = " << std::dec << val << ";" << std::endl;
+		}
+		else if (!strcmp(fixedName, "unsigned char"))
+		{
+			unsigned char val = (unsigned char)(SafeReadUInt16(fieldAddr) & 0xFF);
+			file << "\t\tstatic constexpr unsigned char " << fi->name << " = " << std::dec << (unsigned)val << ";" << std::endl;
 		}
 		else if (!strcmp(fixedName, "double"))
 		{
 			double val = SafeReadDouble(fieldAddr);
 			file << "\t\tstatic constexpr double " << fi->name << " = " << std::defaultfloat << val << ";" << std::endl;
 		}
-		// Skip pointers, arrays, structs ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â can't constexpr those
+		// Skip pointers, arrays, structs - can't constexpr those
 	}
 
 	file << "\t};" << std::endl;
@@ -1307,7 +1335,9 @@ void ClassInfoManager::DumpGetterSetters(std::ofstream& file, std::vector<FieldI
 	for (auto fi : members)
 	{
 		MemberTypeInfo* fti = fi->typeInfo;
+		if (!IsValidPointer(fti)) continue;
 		TypeInfo* mti = fti->typeInfo;
+		if (!IsValidPointer(mti)) continue;
 		const char* fn = GetFixedClassName(mti->name);
 
 		if (mti->flags == kType_Pointer)
@@ -1317,7 +1347,8 @@ void ClassInfoManager::DumpGetterSetters(std::ofstream& file, std::vector<FieldI
 		}
 		else if (mti->flags == kType_Array)
 		{
-			TypeInfo* ati = *(TypeInfo**)mti->enumFields;
+			TypeInfo* ati = (mti->enumFields && IsValidPointer(mti->enumFields)) ? *(TypeInfo**)mti->enumFields : nullptr;
+			if (!IsValidPointer(ati)) continue;
 			if (ati->flags == kType_Pointer)
 				file << "\tArray<" << GetFixedClassName(ati->name) << "*>& Get" << fi->name << "() { return m_" << fi->name << "; }" << std::endl;
 			else
@@ -1355,7 +1386,7 @@ void ClassInfoManager::DumpTemplateClass(ClassInfo* c)
 
 	std::string sanitizedName = GetSanitizedClassName(c->typeInfo->name);
 	char headerFile[128], headerPath[MAX_PATH];
-	sprintf(headerFile, "SDK\\%s.h", sanitizedName.c_str());
+	snprintf(headerFile, sizeof(headerFile), "SDK\\%s.h", sanitizedName.c_str());
 	GetDirFile(headerFile, headerPath, sizeof(headerPath));
 
 	std::ofstream file;
@@ -1384,12 +1415,12 @@ void ClassInfoManager::DumpTemplateClass(ClassInfo* c)
 	int totalSizeOfClass = ti->totalSize;
 	int memberSize = DumpClassMembers(file, members, 0);
 	if (memberSize < totalSizeOfClass)
-		file << "\tunsigned char _0x" << std::hex << memberSize << "[0x" << std::hex << (totalSizeOfClass - memberSize) << "];" << std::endl;
+		file << "\tunsigned char _0x" << std::hex << memberSize << "[0x" << std::hex << (totalSizeOfClass - memberSize) << "];" << std::dec << std::endl;
 
 	file << std::endl;
 	DumpGetterSetters(file, members, ti);
 
-	file << "}; // size = 0x" << std::hex << totalSizeOfClass << std::endl << std::endl;
+	file << "}; // size = 0x" << std::hex << totalSizeOfClass << std::dec << std::endl << std::endl;
 	file << "#endif // FBGEN_" << c->typeInfo->name << "_H" << std::endl;
 
 	file.close();
@@ -1467,7 +1498,7 @@ void ClassInfoManager::GenerateCrossRefFile()
 
 	std::time_t result = std::time(0);
 	file << "//" << std::endl;
-	file << "// FrostbiteGen SDK ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â Cross-Reference Map" << std::endl;
+	file << "// FrostbiteGen SDK - Cross-Reference Map" << std::endl;
 	file << "// Shows which classes hold pointers to each type." << std::endl;
 	file << "// Created: " << std::asctime(std::localtime(&result)) << "//" << std::endl << std::endl;
 
@@ -1498,7 +1529,7 @@ void ClassInfoManager::GenerateHierarchyTree()
 
 	std::time_t result = std::time(0);
 	file << "//" << std::endl;
-	file << "// FrostbiteGen SDK ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â Class Hierarchy" << std::endl;
+	file << "// FrostbiteGen SDK - Class Hierarchy" << std::endl;
 	file << "// Full inheritance tree of all dumped classes." << std::endl;
 	file << "// Created: " << std::asctime(std::localtime(&result)) << "//" << std::endl << std::endl;
 
@@ -1591,7 +1622,8 @@ static SafeFieldData GetSafeFieldData(FieldInfo* fi)
 		
 		if (mti->flags == kType_Array)
 		{
-			TypeInfo* ati = *(TypeInfo**)mti->enumFields;
+			TypeInfo* ati = (mti->enumFields && IsValidPointer(mti->enumFields)) ? *(TypeInfo**)mti->enumFields : nullptr;
+			if (!IsValidPointer(ati)) return data;
 			if (ati && IsValidPointer(ati) && ati->name && IsValidPointer((void*)ati->name))
 			{
 				data.typeName = ati->name;
@@ -2016,14 +2048,14 @@ void ClassInfoManager::GenerateGhidraScript()
 		}
 	}
 	
-	file << "println('FrostbiteGen SDK imported: ' + str(" << std::dec << m_classMap.size() << ") + ' types, ' + str(" << m_globalInstances.size() << ") + ' singletons labeled')" << std::endl;
+	file << "print('FrostbiteGen SDK imported: ' + str(" << std::dec << m_classMap.size() << ") + ' types, ' + str(" << m_globalInstances.size() << ") + ' singletons labeled')" << std::endl;
 
 	file.close();
 	Log("Generated ghidra_import.py");
 }
 
 // ============================================================================
-// Utility Header Generation (FBSDKTypes.h ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â unchanged from v1)
+// Utility Header Generation (FBSDKTypes.h - unchanged from v1)
 // ============================================================================
 
 void ClassInfoManager::GenerateFBSDKTypes()
@@ -2214,9 +2246,7 @@ std::string ClassInfoManager::GetSanitizedClassName(const char* name)
 }
 
 
-inline bool LocalIsValidPtr(void* ptr) {
-	return ptr != nullptr && (uintptr_t)ptr > 0x10000 && (uintptr_t)ptr < 0x00007FFFFFFFFFFF;
-}
+
 void ClassInfoManager::DumpLiveInstances()
 {
 	char filePath[MAX_PATH];
@@ -2232,11 +2262,11 @@ void ClassInfoManager::DumpLiveInstances()
 	for (auto& pair : m_globalInstances)
 	{
 		uintptr_t addr = pair.second + m_moduleBase; // pair.second is an offset!
-		if (!LocalIsValidPtr((void*)addr)) continue;
+		if (!IsValidPointer((void*)addr)) continue;
 		
 		uintptr_t instance = 0;
 		if (!SafeReadBytes(addr, &instance, sizeof(uintptr_t))) continue;
-		if (!LocalIsValidPtr((void*)instance)) continue;
+		if (!IsValidPointer((void*)instance)) continue;
 		
 		if (!firstSingleton) file << "," << std::endl;
 		file << "  \"" << pair.first << "\": \"0x" << std::hex << instance << "\"";
@@ -2246,4 +2276,73 @@ void ClassInfoManager::DumpLiveInstances()
 	file << std::endl << "}" << std::endl;
 	file.close();
 	Log("Generated LiveDump.json");
+}
+
+void ClassInfoManager::GenerateCheatEngineTable()
+{
+	char filePath[MAX_PATH];
+	GetDirFile("SDK\\CheatEngineTable.CT", filePath, sizeof(filePath));
+	std::ofstream file(filePath, std::ios::out | std::ios::trunc);
+	if (!file.is_open()) { Log("Failed to open CheatEngineTable.CT"); return; }
+
+	file << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+	file << "<CheatTable CheatEngineTableVersion=\"45\">\n";
+	file << "  <CheatEntries/>\n";
+	file << "  <UserdefinedSymbols/>\n";
+	file << "  <Structures StructVersion=\"2\">\n";
+
+	for (auto it = m_classMap.rbegin(); it != m_classMap.rend(); ++it)
+	{
+		ClassInfo* c = it->second;
+		if (!c || !IsValidPointer(c) || !IsValidPointer(c->typeInfo)) continue;
+		TypeInfo* ti = c->typeInfo;
+		
+		char nameBuf[256] = {0};
+		if (!ti || !IsValidPointer((void*)ti->name) || !SafeReadString((uintptr_t)ti->name, nameBuf, sizeof(nameBuf)) || nameBuf[0] == 0) continue;
+
+		std::string className = GetSanitizedClassName(nameBuf);
+		file << "    <Structure Name=\"" << className << "\" AutoFill=\"0\" AutoCreate=\"1\" DefaultHex=\"0\" AutoDestroy=\"0\" DoNotSaveLocal=\"0\" RLECompression=\"1\" AutoCreateStructsize=\"4096\">\n";
+		file << "      <Elements>\n";
+
+		std::vector<FieldInfo*> members;
+		ParseClassMembers(ti, members);
+		
+		for (FieldInfo* field : members)
+		{
+			if (!IsValidPointer(field)) continue;
+
+			unsigned short fieldOffset = SafeReadUInt16((uintptr_t)&field->offset);
+
+			char fieldBuf[256] = {0};
+			std::string fieldName = (IsValidPointer((void*)field->name) && SafeReadString((uintptr_t)field->name, fieldBuf, sizeof(fieldBuf)) && fieldBuf[0] != 0) ? fieldBuf : ("unk_" + std::to_string(fieldOffset));
+
+			int size = field->GetFieldSize();
+			std::string ceType = "4 Bytes";
+			if (size == 1) ceType = "Byte";
+			else if (size == 2) ceType = "2 Bytes";
+			else if (size == 4) ceType = "4 Bytes";
+			else if (size == 8) ceType = "8 Bytes";
+			else ceType = "Array of byte";
+
+			if (IsValidPointer(field->typeInfo) && IsValidPointer(field->typeInfo->typeInfo))
+			{
+				unsigned short flags = SafeReadUInt16((uintptr_t)&field->typeInfo->typeInfo->flags);
+				if (flags == kType_Pointer)
+				{
+					ceType = "Pointer";
+				}
+			}
+
+			file << "        <Element Offset=\"" << fieldOffset << "\" Vartype=\"" << ceType << "\" Bytesize=\"" << size << "\" OffsetHex=\"" << std::hex << std::uppercase << fieldOffset << std::nouppercase << std::dec << "\" Description=\"" << fieldName << "\" DisplayMethod=\"Unsigned Integer\"/>\n";
+		}
+
+		file << "      </Elements>\n";
+		file << "    </Structure>\n";
+	}
+
+	file << "  </Structures>\n";
+	file << "</CheatTable>\n";
+	file.close();
+
+	Log("Generated CheatEngineTable.CT");
 }

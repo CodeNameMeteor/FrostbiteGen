@@ -127,27 +127,24 @@ inline bool IsModulePointer(void* ptr, uintptr_t modBase, uintptr_t modEnd)
 }
 
 /// Safely count vtable entries starting from an object's vtable pointer.
-/// Walks forward until a non-module pointer is hit (max 256 entries).
+/// Safely count vtable entries starting from an object's vtable pointer.
+/// Walks forward until a non-module pointer or unmapped page is hit (max 256 entries).
 inline int SafeCountVTableEntries(void* instance, uintptr_t modBase, uintptr_t modEnd)
 {
-	__try
-	{
-		if (!IsValidPointer(instance)) return 0;
-		void** vtable = *(void***)instance;
-		if (!IsValidPointer(vtable)) return 0;
+	if (!IsValidPointer(instance)) return 0;
+	void** vtable = (void**)SafeReadPointer((uintptr_t)instance);
+	if (!IsValidPointer(vtable)) return 0;
 
-		int count = 0;
-		while (count < 256)
-		{
-			void* entry = vtable[count];
-			if (!IsValidPointer(entry)) break;
-			uintptr_t addr = (uintptr_t)entry;
-			if (addr < modBase || addr >= modEnd) break;
-			count++;
-		}
-		return count;
+	int count = 0;
+	while (count < 256)
+	{
+		void* entry = SafeReadPointer((uintptr_t)&vtable[count]);
+		if (!IsValidPointer(entry)) break;
+		uintptr_t addr = (uintptr_t)entry;
+		if (addr < modBase || addr >= modEnd) break;
+		count++;
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+	return count;
 }
 
 /// Safely read a vtable entry at a given index. Returns 0 on fault.
@@ -194,18 +191,15 @@ public:
 			if (!dwMatch)
 				return NULL;
 
-			DWORD_PTR dwOffset = *(DWORD*)(dwMatch + 3);
-
-			BYTE* first = (BYTE*)&dwOffset;
-			if (first[3] == 0xFF)
-				dwOffset = dwOffset + 0xFFFFFFFF00000000;
-
+			int32_t dwOffset = *(int32_t*)(dwMatch + 3);
 			DWORD_PTR dwOffset2 = (dwMatch + 7);
 
-			instance = (ClassInfo**)(dwOffset + dwOffset2);
+			instance = (ClassInfo**)(dwOffset2 + (int64_t)dwOffset);
 			Log("Instance found at 0x%016llX", instance);
 		}
-		return *instance;
+		if (!IsValidPointer(instance))
+			return NULL;
+		return (ClassInfo*)SafeReadPointer((uintptr_t)instance);
 	}
 
 	TypeInfo* typeInfo; //0x0000 
@@ -295,7 +289,7 @@ public:
 				return 8;
 				
 			case kType_Array:
-				return 8;
+				return 32; // sizeof(fb::Array<T>) = 4 pointers (32 bytes on x64)
 
 			default:
 				return ti->totalSize;
@@ -322,6 +316,8 @@ public:
 };
 inline bool SafeReadString(uintptr_t addr, char* dst, size_t maxLen)
 {
+	if (!dst || maxLen == 0 || !IsValidPointer((void*)addr)) return false;
+	dst[0] = 0;
 	__try 
 	{
 		for (size_t i = 0; i < maxLen - 1; i++)
@@ -331,9 +327,7 @@ inline bool SafeReadString(uintptr_t addr, char* dst, size_t maxLen)
 			if (c == 0) 
 			{
 				dst[i] = 0;
-				// An empty string is probably invalid for a name, but technically read correctly.
-				// However, if i == 0, we can let it return true and the caller handles empty strings.
-				return true;
+				return (i > 0);
 			}
 			
 			// If it's not a printable ASCII character, this is likely a garbage pointer.
@@ -349,5 +343,5 @@ inline bool SafeReadString(uintptr_t addr, char* dst, size_t maxLen)
 		dst[maxLen - 1] = 0;
 		return true;
 	}
-	__except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+	__except(EXCEPTION_EXECUTE_HANDLER) { dst[0] = 0; return false; }
 }

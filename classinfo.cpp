@@ -1,4 +1,4 @@
-﻿#include "classinfo.h"
+#include "classinfo.h"
 
 // ============================================================================
 // Constructor
@@ -17,6 +17,98 @@ ClassInfoManager::ClassInfoManager(ClassInfo* info) :
 }
 
 // ============================================================================
+// Sanitization and Escaping Helpers
+// ============================================================================
+
+std::string ClassInfoManager::SanitizeMemberName(const std::string& orig)
+{
+	if (orig.empty()) return "unk";
+
+	// List of C++ keywords
+	static const std::set<std::string> keywords = {
+		"alignas", "alignof", "and", "and_eq", "asm", "atomic_cancel", "atomic_commit",
+		"atomic_noexcept", "auto", "bitand", "bitor", "bool", "break", "case", "catch",
+		"char", "char8_t", "char16_t", "char32_t", "class", "compl", "concept", "const",
+		"consteval", "constexpr", "constinit", "const_cast", "continue", "co_await",
+		"co_return", "co_yield", "decltype", "default", "delete", "do", "double",
+		"dynamic_cast", "else", "enum", "explicit", "export", "extern", "false", "float",
+		"for", "friend", "goto", "if", "inline", "int", "long", "mutable", "namespace",
+		"new", "noexcept", "not", "not_eq", "nullptr", "operator", "or", "or_eq",
+		"private", "protected", "public", "reflexpr", "register", "reinterpret_cast",
+		"requires", "return", "short", "signed", "sizeof", "static", "static_assert",
+		"static_cast", "struct", "switch", "synchronized", "template", "this",
+		"thread_local", "throw", "true", "try", "typedef", "typeid", "typename",
+		"union", "unsigned", "using", "virtual", "void", "volatile", "wchar_t",
+		"while", "xor", "xor_eq"
+	};
+
+	std::string s = orig;
+	for (char& c : s)
+	{
+		if (!isalnum((unsigned char)c) && c != '_')
+			c = '_';
+	}
+	if (!s.empty() && isdigit((unsigned char)s[0]))
+		s = "_" + s;
+
+	if (keywords.count(s))
+		s += "_";
+
+	return s;
+}
+
+std::string ClassInfoManager::EscapeXml(const std::string& s)
+{
+	std::string out;
+	out.reserve(s.size() + 16);
+	for (char c : s)
+	{
+		switch (c)
+		{
+		case '&':  out += "&amp;";  break;
+		case '\"': out += "&quot;"; break;
+		case '\'': out += "&apos;"; break;
+		case '<':  out += "&lt;";   break;
+		case '>':  out += "&gt;";   break;
+		default:   out += c;        break;
+		}
+	}
+	return out;
+}
+
+std::string ClassInfoManager::EscapeJson(const std::string& s)
+{
+	std::string out;
+	out.reserve(s.size() + 16);
+	for (char c : s)
+	{
+		switch (c)
+		{
+		case '\"': out += "\\\""; break;
+		case '\\': out += "\\\\"; break;
+		case '\b': out += "\\b";  break;
+		case '\f': out += "\\f";  break;
+		case '\n': out += "\\n";  break;
+		case '\r': out += "\\r";  break;
+		case '\t': out += "\\t";  break;
+		default:
+			if ((unsigned char)c < 0x20)
+			{
+				char buf[8];
+				snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+				out += buf;
+			}
+			else
+			{
+				out += c;
+			}
+			break;
+		}
+	}
+	return out;
+}
+
+// ============================================================================
 // Class List & Dump Entry Points
 // ============================================================================
 
@@ -24,19 +116,23 @@ void ClassInfoManager::BuildClassList()
 {
 	ClassInfo* c = m_listHead;
 	std::set<ClassInfo*> visited;
-	while (c != NULL)
+	while (c != NULL && IsValidPointer(c))
 	{
 		if (visited.count(c))
 			break; // cycle detected
 		visited.insert(c);
-		if (c->typeInfo && c->typeInfo->name)
+		if (IsValidPointer(c->typeInfo) && IsValidPointer((void*)c->typeInfo->name))
 		{
-			m_classMap[c->typeInfo->name] = c;
-			// Build reverse map: TypeInfo address AND ClassInfo address -> ClassInfo
-			m_typeInfoToClassMap[(uintptr_t)c->typeInfo] = c;
-			m_typeInfoToClassMap[(uintptr_t)c] = c;
+			char nameBuf[256] = { 0 };
+			if (SafeReadString((uintptr_t)c->typeInfo->name, nameBuf, sizeof(nameBuf)) && nameBuf[0] != 0)
+			{
+				m_classMap[nameBuf] = c;
+				// Build reverse map: TypeInfo address AND ClassInfo address -> ClassInfo
+				m_typeInfoToClassMap[(uintptr_t)c->typeInfo] = c;
+				m_typeInfoToClassMap[(uintptr_t)c] = c;
+			}
 		}
-		c = c->next;
+		c = (ClassInfo*)SafeReadPointer((uintptr_t)&c->next);
 	}
 	Log("BuildClassList: %d classes, %d TypeInfo mappings",
 		(int)m_classMap.size(), (int)m_typeInfoToClassMap.size());
@@ -80,6 +176,8 @@ void ClassInfoManager::DumpClasses()
 				std::string realName = contextCI->typeInfo->name;
 				TraversalChain rootChain;
 				rootChain.targetClass = realName;
+				rootChain.rootClassName = realName;
+				rootChain.rootGlobalOffset = m_clientGameCtxGlobalOffset;
 				rootChain.resolvedAddress = m_clientGameCtxInstance;
 				m_traversalMap.erase("UnknownRoot");
 				m_traversalMap[realName] = rootChain;
@@ -90,10 +188,12 @@ void ClassInfoManager::DumpClasses()
 		std::set<uintptr_t> visited;
 		visited.insert(m_clientGameCtxInstance);
 
+		std::string rootName = contextCI && contextCI->typeInfo && contextCI->typeInfo->name ? contextCI->typeInfo->name : "ClientGameContext";
+
 		if (contextCI)
 		{
 			// Known class - use field-based traversal
-			BuildTraversalMap(m_clientGameCtxInstance, contextCI, 0, rootChain, visited);
+			BuildTraversalMap(m_clientGameCtxInstance, contextCI, 0, rootChain, visited, m_clientGameCtxGlobalOffset, rootName);
 		}
 		else if (m_clientGameCtxInstance)
 		{
@@ -107,16 +207,18 @@ void ClassInfoManager::DumpClasses()
 
 				TraversalChain identifiedRootChain;
 				identifiedRootChain.targetClass = targetName;
+				identifiedRootChain.rootClassName = targetName;
+				identifiedRootChain.rootGlobalOffset = m_clientGameCtxGlobalOffset;
 				identifiedRootChain.steps = rootChain;
 				identifiedRootChain.resolvedAddress = m_clientGameCtxInstance;
 				m_traversalMap[targetName] = identifiedRootChain;
 
-				BuildTraversalMap(m_clientGameCtxInstance, identifiedRoot, 1, rootChain, visited);
+				BuildTraversalMap(m_clientGameCtxInstance, identifiedRoot, 1, rootChain, visited, m_clientGameCtxGlobalOffset, targetName);
 			}
 			else
 			{
 				Log("  -> Root class still unknown, using blind traversal fallback...");
-				BlindTraversalWalk(m_clientGameCtxInstance, 0, rootChain, visited);
+				BlindTraversalWalk(m_clientGameCtxInstance, 0, rootChain, visited, m_clientGameCtxGlobalOffset, rootName);
 			}
 		}
 
@@ -216,8 +318,6 @@ uintptr_t ClassInfoManager::FindClientGameContext()
 		void* explicitPtr = SafeReadPointer(explicitGlobal);
 		if (explicitPtr && IsValidPointer(explicitPtr))
 		{
-			Log("  Found instance at explicit global: 0x%016llX", (uintptr_t)explicitPtr);
-			m_clientGameCtxGlobalOffset = explicitGlobalOffset;
 			// Try to identify it by dereferencing
 			ClassInfo* id = TryIdentifyClassByVTable((uintptr_t)explicitPtr, true);
 			if (!id)
@@ -229,15 +329,32 @@ uintptr_t ClassInfoManager::FindClientGameContext()
 
 			if (id && id->typeInfo && id->typeInfo->name)
 			{
+				m_clientGameCtxGlobalOffset = explicitGlobalOffset;
+				Log("  Found instance at explicit global: 0x%016llX (%s)", (uintptr_t)explicitPtr, id->typeInfo->name);
 				TraversalChain rootChain;
 				rootChain.targetClass = id->typeInfo->name;
+				rootChain.rootClassName = id->typeInfo->name;
+				rootChain.rootGlobalOffset = explicitGlobalOffset;
 				rootChain.resolvedAddress = (uintptr_t)explicitPtr;
 				m_traversalMap[id->typeInfo->name] = rootChain;
 				return (uintptr_t)explicitPtr;
 			}
 			
-			// If it has no RTTI, return it anyway
-			return (uintptr_t)explicitPtr;
+			// Validate vtable in module before accepting generic instance
+			void* vt = SafeReadPointer((uintptr_t)explicitPtr);
+			if (vt && IsModulePointer(vt, m_moduleBase, m_moduleEnd))
+			{
+				m_clientGameCtxGlobalOffset = explicitGlobalOffset;
+				Log("  Found instance at explicit global with valid vtable: 0x%016llX", (uintptr_t)explicitPtr);
+				TraversalChain rootChain;
+				rootChain.targetClass = "ClientGameContext";
+				rootChain.rootClassName = "ClientGameContext";
+				rootChain.rootGlobalOffset = explicitGlobalOffset;
+				rootChain.resolvedAddress = (uintptr_t)explicitPtr;
+				m_traversalMap["ClientGameContext"] = rootChain;
+				return (uintptr_t)explicitPtr;
+			}
+			Log("  Explicit pointer 0x%016llX lacks valid module vtable. Falling back to dynamic heuristic scan...", (uintptr_t)explicitPtr);
 		}
 	}
 	else
@@ -405,6 +522,8 @@ uintptr_t ClassInfoManager::FindClientGameContext()
 
 				TraversalChain rootChain;
 				rootChain.targetClass = contextClassName;
+				rootChain.rootClassName = contextClassName;
+				rootChain.rootGlobalOffset = m_clientGameCtxGlobalOffset;
 				rootChain.resolvedAddress = (uintptr_t)objPtr;
 				m_traversalMap[contextClassName] = rootChain;
 
@@ -487,6 +606,8 @@ uintptr_t ClassInfoManager::FindClientGameContext()
 
 			TraversalChain rootChain;
 			rootChain.targetClass = contextClassName;
+			rootChain.rootClassName = contextClassName;
+			rootChain.rootGlobalOffset = m_clientGameCtxGlobalOffset;
 			rootChain.resolvedAddress = (uintptr_t)bestObj;
 			m_traversalMap[contextClassName] = rootChain;
 
@@ -503,7 +624,8 @@ uintptr_t ClassInfoManager::FindClientGameContext()
 // ============================================================================
 
 void ClassInfoManager::BuildTraversalMap(uintptr_t instanceAddr, ClassInfo* classInfo,
-	int depth, std::vector<TraversalStep>& currentChain, std::set<uintptr_t>& visited)
+	int depth, std::vector<TraversalStep>& currentChain, std::set<uintptr_t>& visited,
+	uintptr_t rootGlobalOffset, const std::string& rootClassName)
 {
 	if (depth > 5 || !classInfo || !classInfo->typeInfo)
 		return;
@@ -511,6 +633,9 @@ void ClassInfoManager::BuildTraversalMap(uintptr_t instanceAddr, ClassInfo* clas
 	TypeInfo* ti = classInfo->typeInfo;
 	if (!ti->fields || ti->fieldCount == 0)
 		return;
+
+	uintptr_t effectiveRootOffset = rootGlobalOffset != 0 ? rootGlobalOffset : m_clientGameCtxGlobalOffset;
+	std::string effectiveRootClass = rootClassName.empty() ? "ClientGameContext" : rootClassName;
 
 	// Walk this class's pointer fields
 	for (int i = 0; i < ti->fieldCount; ++i)
@@ -559,12 +684,14 @@ void ClassInfoManager::BuildTraversalMap(uintptr_t instanceAddr, ClassInfo* clas
 		{
 			TraversalChain chain;
 			chain.targetClass = targetName;
+			chain.rootClassName = effectiveRootClass;
+			chain.rootGlobalOffset = effectiveRootOffset;
 			chain.steps = newChain;
 			chain.resolvedAddress = (uintptr_t)fieldPtr;
 			m_traversalMap[targetName] = chain;
 
-			Log("  Traversal: %s @ depth %d, offset chain length %d, addr 0x%016llX",
-				targetName.c_str(), depth, (int)newChain.size(), (uintptr_t)fieldPtr);
+			Log("  Traversal: %s @ depth %d, offset chain length %d, addr 0x%016llX (via %s)",
+				targetName.c_str(), depth, (int)newChain.size(), (uintptr_t)fieldPtr, effectiveRootClass.c_str());
 
 			// Capture vtable info for this instance
 			int vtableCount = SafeCountVTableEntries(fieldPtr, m_moduleBase, m_moduleEnd);
@@ -587,14 +714,14 @@ void ClassInfoManager::BuildTraversalMap(uintptr_t instanceAddr, ClassInfo* clas
 		if (targetClassIt != m_classMap.end())
 		{
 			BuildTraversalMap((uintptr_t)fieldPtr, targetClassIt->second,
-				depth + 1, newChain, visited);
+				depth + 1, newChain, visited, effectiveRootOffset, effectiveRootClass);
 		}
 	}
 
 	// Also walk parent class fields
 	if (classInfo->parent && classInfo->parent != classInfo)
 	{
-		BuildTraversalMap(instanceAddr, classInfo->parent, depth, currentChain, visited);
+		BuildTraversalMap(instanceAddr, classInfo->parent, depth, currentChain, visited, effectiveRootOffset, effectiveRootClass);
 	}
 }
 
@@ -619,6 +746,10 @@ ClassInfo* ClassInfoManager::TryIdentifyClassByVTable(uintptr_t instanceAddr, bo
 
 		for (int j = 0; j < sizeof(code) - 7; j++)
 		{
+			// If we hit RET (0xC3) or INT3 (0xCC), stop scanning this function to avoid bleeding into adjacent functions
+			if (code[j] == 0xC3 || code[j] == 0xCC)
+				break;
+
 			if ((code[j] == 0x48 && code[j+1] == 0x8D && code[j+2] == 0x05) || // lea rax
 			    (code[j] == 0x48 && code[j+1] == 0x8B && code[j+2] == 0x05) || // mov rax
 			    (code[j] == 0x48 && code[j+1] == 0x8D && code[j+2] == 0x0D))   // lea rcx
@@ -654,12 +785,16 @@ ClassInfo* ClassInfoManager::TryIdentifyClassByVTable(uintptr_t instanceAddr, bo
 
 void ClassInfoManager::BlindTraversalWalk(uintptr_t objectAddr, int depth,
 	std::vector<TraversalStep>& currentChain,
-	std::set<uintptr_t>& visited)
+	std::set<uintptr_t>& visited,
+	uintptr_t rootGlobalOffset, const std::string& rootClassName)
 {
 	if (depth > 4) return;
 	bool isRoot = (depth == 0);
 
-	if (isRoot) Log("  Starting BlindTraversalWalk on root 0x%llX", objectAddr);
+	uintptr_t effectiveRootOffset = rootGlobalOffset != 0 ? rootGlobalOffset : m_clientGameCtxGlobalOffset;
+	std::string effectiveRootClass = rootClassName.empty() ? "ClientGameContext" : rootClassName;
+
+	if (isRoot) Log("  Starting BlindTraversalWalk on root 0x%llX (%s)", objectAddr, effectiveRootClass.c_str());
 
 	for (int off = 0x08; off < 0x200; off += 8)
 	{
@@ -703,11 +838,14 @@ void ClassInfoManager::BlindTraversalWalk(uintptr_t objectAddr, int depth,
 			{
 				TraversalChain chain;
 				chain.targetClass = targetName;
+				chain.rootClassName = effectiveRootClass;
+				chain.rootGlobalOffset = effectiveRootOffset;
 				chain.steps = newChain;
 				chain.resolvedAddress = (uintptr_t)ptr;
 				m_traversalMap[targetName] = chain;
 
-				Log("  [!] Blind Traversal Found: %s @ offset 0x%X, depth %d", targetName.c_str(), off, depth);
+				Log("  [!] Blind Traversal Found: %s @ offset 0x%X, depth %d (via %s)",
+					targetName.c_str(), off, depth, effectiveRootClass.c_str());
 
 				int vtableCount = SafeCountVTableEntries(ptr, m_moduleBase, m_moduleEnd);
 				if (vtableCount > 0)
@@ -724,7 +862,7 @@ void ClassInfoManager::BlindTraversalWalk(uintptr_t objectAddr, int depth,
 			}
 
 			visited.insert((uintptr_t)ptr);
-			BuildTraversalMap((uintptr_t)ptr, identifiedClass, depth + 1, newChain, visited);
+			BuildTraversalMap((uintptr_t)ptr, identifiedClass, depth + 1, newChain, visited, effectiveRootOffset, effectiveRootClass);
 		}
 		else
 		{
@@ -733,7 +871,7 @@ void ClassInfoManager::BlindTraversalWalk(uintptr_t objectAddr, int depth,
 			newChain.push_back(step);
 
 			visited.insert((uintptr_t)ptr);
-			BlindTraversalWalk((uintptr_t)ptr, depth + 1, newChain, visited);
+			BlindTraversalWalk((uintptr_t)ptr, depth + 1, newChain, visited, effectiveRootOffset, effectiveRootClass);
 		}
 	}
 }
@@ -768,6 +906,7 @@ void ClassInfoManager::DumpClass(ClassInfo* c)
 	file << "#define FBGEN_" << sanitizedName << "_H" << std::endl << std::endl;
 
 	file << "#include \"FBSDKTypes.h\"" << std::endl;
+	file << "#include \"FBClasses.h\"" << std::endl;
 
 	std::vector<FieldInfo*> members;
 	ParseClassMembers(ti, members);
@@ -855,6 +994,7 @@ void ClassInfoManager::DumpStruct(ClassInfo* c)
 	file << std::endl << "#ifndef FBGEN_" << sanitizedName << "_H" << std::endl;
 	file << "#define FBGEN_" << sanitizedName << "_H" << std::endl << std::endl;
 	file << "#include \"FBSDKTypes.h\"" << std::endl;
+	file << "#include \"FBClasses.h\"" << std::endl;
 
 	std::vector<FieldInfo*> members;
 	ParseStructMembers(ti, members);
@@ -934,8 +1074,11 @@ void ClassInfoManager::ResolveHeaders(const std::vector<FieldInfo*>& members, st
 	for (int i = 0; i < (int)members.size(); ++i)
 	{
 		FieldInfo* fi = members.at(i);
-		const char* tn = fi->typeInfo->typeInfo->name;
-		if (emittedTypes.count(tn))
+		if (!fi || !fi->typeInfo || !fi->typeInfo->typeInfo)
+			continue;
+		TypeInfo* fieldType = fi->typeInfo->typeInfo;
+		const char* tn = fieldType->name;
+		if (!tn || emittedTypes.count(tn))
 			continue;
 		emittedTypes.insert(tn);
 
@@ -944,11 +1087,12 @@ void ClassInfoManager::ResolveHeaders(const std::vector<FieldInfo*>& members, st
 			!strcmp(tn, "Uint8") || !strcmp(tn, "Uint16") || !strcmp(tn, "Uint32") || !strcmp(tn, "Uint64") ||
 			!strcmp(tn, "CString"))
 			continue;
-		if (fi->typeInfo->typeInfo->flags == kType_Array)
-		{
-			file << "#include \"Array.h\"" << std::endl;
+
+		// Pointer fields and Arrays only need the forward declaration from FBClasses.h!
+		// Including the full header for pointers causes massive circular dependency cycles.
+		if (fieldType->flags == kType_Pointer || fieldType->flags == kType_Array)
 			continue;
-		}
+
 		file << "#include \"" << tn << ".h\"" << std::endl;
 	}
 }
@@ -1029,19 +1173,21 @@ int ClassInfoManager::DumpClassMembers(std::ofstream& file, std::vector<FieldInf
 		TypeInfo* mti = fti->typeInfo;
 		if (!IsValidPointer(mti)) continue;
 
+		std::string safeName = SanitizeMemberName(fi->name ? fi->name : "unk");
+
 		if (mti->flags == kType_Pointer)
-			file << "\t" << GetFixedClassName(mti->name) << "* m_" << fi->name << "; // 0x" << std::hex << fi->offset << std::endl;
+			file << "\t" << GetFixedClassName(mti->name) << "* m_" << safeName << "; // 0x" << std::hex << fi->offset << std::endl;
 		else if (mti->flags == kType_Array)
 		{
 			TypeInfo* ati = (mti->enumFields && IsValidPointer(mti->enumFields)) ? *(TypeInfo**)mti->enumFields : nullptr;
 			if (!IsValidPointer(ati)) continue;
 			if (ati->flags == kType_Pointer)
-				file << "\tArray<" << GetFixedClassName(ati->name) << "*> m_" << fi->name << "; // 0x" << std::hex << fi->offset << std::endl;
+				file << "\tArray<" << GetFixedClassName(ati->name) << "*> m_" << safeName << "; // 0x" << std::hex << fi->offset << std::endl;
 			else
-				file << "\tArray<" << GetFixedClassName(ati->name) << "> m_" << fi->name << "; // 0x" << std::hex << fi->offset << std::endl;
+				file << "\tArray<" << GetFixedClassName(ati->name) << "> m_" << safeName << "; // 0x" << std::hex << fi->offset << std::endl;
 		}
 		else
-			file << "\t" << GetFixedClassName(fti->typeInfo->name) << " m_" << fi->name << "; // 0x" << std::hex << fi->offset << std::endl;
+			file << "\t" << GetFixedClassName(fti->typeInfo->name) << " m_" << safeName << "; // 0x" << std::hex << fi->offset << std::endl;
 
 		totalSize += fi->GetFieldSize();
 	}
@@ -1078,7 +1224,7 @@ void ClassInfoManager::DumpTypeInfo(ClassInfo* c, std::ofstream& file)
 }
 
 // ============================================================================
-// P0: Instance Resolver (rewritten - ClientGameContext traversal)
+// P0: Instance Resolver (ClientGameContext / singleton traversal)
 // ============================================================================
 
 void ClassInfoManager::DumpInstanceResolver(ClassInfo* c, std::ofstream& file)
@@ -1108,19 +1254,20 @@ void ClassInfoManager::DumpInstanceResolver(ClassInfo* c, std::ofstream& file)
 	else
 	{
 		auto it = m_traversalMap.find(className);
-		if (it != m_traversalMap.end() && !it->second.steps.empty() && m_clientGameCtxGlobalOffset != 0)
+		if (it != m_traversalMap.end() && !it->second.steps.empty() && it->second.rootGlobalOffset != 0)
 		{
 			const TraversalChain& chain = it->second;
+			std::string rootName = chain.rootClassName.empty() ? "ClientGameContext" : chain.rootClassName;
 
 			// Build the ReadChain offset list
-			file << "\t\t// Resolved via ClientGameContext traversal:" << std::endl;
-			file << "\t\t// ClientGameContext";
+			file << "\t\t// Resolved via " << rootName << " traversal:" << std::endl;
+			file << "\t\t// " << rootName;
 			for (auto& step : chain.steps)
 				file << " -> +" << std::hex << "0x" << step.offset << " (" << step.fieldName << ")";
 			file << std::endl;
 
 			file << "\t\tuintptr_t ctx = fb::Read<uintptr_t>(fb::GetModuleBase() + 0x"
-				<< std::hex << m_clientGameCtxGlobalOffset << ");" << std::endl;
+				<< std::hex << chain.rootGlobalOffset << "); // " << rootName << std::endl;
 			file << "\t\tif (!ctx) return nullptr;" << std::endl;
 
 			// Chain through each step
@@ -1136,7 +1283,7 @@ void ClassInfoManager::DumpInstanceResolver(ClassInfo* c, std::ofstream& file)
 		else
 		{
 			// Not found in traversal - emit stub
-			file << "\t\t// WARNING: No traversal chain found from ClientGameContext." << std::endl;
+			file << "\t\t// WARNING: No traversal chain found from ClientGameContext or singletons." << std::endl;
 			file << "\t\t// This class was not reachable during SDK generation." << std::endl;
 			file << "\t\t// Use fb::PatternScan() or manual pointer chains to resolve." << std::endl;
 			file << "\t\treturn nullptr;" << std::endl;
@@ -1155,12 +1302,13 @@ void ClassInfoManager::DumpTraversalChainComment(ClassInfo* c, std::ofstream& fi
 	std::string className = c->typeInfo->name;
 	auto it = m_traversalMap.find(className);
 
-	if (it != m_traversalMap.end())
+	if (it != m_traversalMap.end() && it->second.rootGlobalOffset != 0)
 	{
 		const TraversalChain& chain = it->second;
+		std::string rootName = chain.rootClassName.empty() ? "ClientGameContext" : chain.rootClassName;
 		file << "\t// -------------------------------------------------------" << std::endl;
-		file << "\t// Traversal chain from ClientGameContext:" << std::endl;
-		file << "\t//   ClientGameContext* (Module+0x" << std::hex << m_clientGameCtxGlobalOffset << ")" << std::endl;
+		file << "\t// Traversal chain from " << rootName << ":" << std::endl;
+		file << "\t//   " << rootName << "* (Module+0x" << std::hex << chain.rootGlobalOffset << ")" << std::endl;
 
 		std::string indent = "\t//     ";
 		for (auto& step : chain.steps)
@@ -1200,52 +1348,53 @@ void ClassInfoManager::DumpDefaultValues(ClassInfo* c, std::ofstream& file,
 		if (!IsValidPointer(mti)) continue;
 		const char* fixedName = GetFixedClassName(mti->name);
 		uintptr_t fieldAddr = instanceAddr + fi->offset;
+		std::string safeName = SanitizeMemberName(fi->name ? fi->name : "unk");
 
 		// Only snapshot simple value types
 		if (!strcmp(fixedName, "bool"))
 		{
 			bool val = SafeReadBool(fieldAddr);
-			file << "\t\tstatic constexpr bool " << fi->name << " = " << (val ? "true" : "false") << ";" << std::endl;
+			file << "\t\tstatic constexpr bool " << safeName << " = " << (val ? "true" : "false") << ";" << std::endl;
 		}
 		else if (!strcmp(fixedName, "float"))
 		{
 			float val = SafeReadFloat(fieldAddr);
-			file << "\t\tstatic constexpr float " << fi->name << " = " << std::defaultfloat << val << "f;" << std::endl;
+			file << "\t\tstatic constexpr float " << safeName << " = " << std::defaultfloat << val << "f;" << std::endl;
 		}
 		else if (!strcmp(fixedName, "int"))
 		{
 			int val = SafeReadInt32(fieldAddr);
-			file << "\t\tstatic constexpr int " << fi->name << " = " << std::dec << val << ";" << std::endl;
+			file << "\t\tstatic constexpr int " << safeName << " = " << std::dec << val << ";" << std::endl;
 		}
 		else if (!strcmp(fixedName, "short"))
 		{
 			short val = (short)SafeReadUInt16(fieldAddr);
-			file << "\t\tstatic constexpr short " << fi->name << " = " << std::dec << val << ";" << std::endl;
+			file << "\t\tstatic constexpr short " << safeName << " = " << std::dec << val << ";" << std::endl;
 		}
 		else if (!strcmp(fixedName, "char"))
 		{
 			char val = (char)(SafeReadUInt16(fieldAddr) & 0xFF);
-			file << "\t\tstatic constexpr char " << fi->name << " = " << std::dec << (int)val << ";" << std::endl;
+			file << "\t\tstatic constexpr char " << safeName << " = " << std::dec << (int)val << ";" << std::endl;
 		}
 		else if (!strcmp(fixedName, "unsigned int"))
 		{
 			unsigned int val = SafeReadUInt32(fieldAddr);
-			file << "\t\tstatic constexpr unsigned int " << fi->name << " = " << std::dec << val << ";" << std::endl;
+			file << "\t\tstatic constexpr unsigned int " << safeName << " = " << std::dec << val << ";" << std::endl;
 		}
 		else if (!strcmp(fixedName, "unsigned short"))
 		{
 			unsigned short val = SafeReadUInt16(fieldAddr);
-			file << "\t\tstatic constexpr unsigned short " << fi->name << " = " << std::dec << val << ";" << std::endl;
+			file << "\t\tstatic constexpr unsigned short " << safeName << " = " << std::dec << val << ";" << std::endl;
 		}
 		else if (!strcmp(fixedName, "unsigned char"))
 		{
 			unsigned char val = (unsigned char)(SafeReadUInt16(fieldAddr) & 0xFF);
-			file << "\t\tstatic constexpr unsigned char " << fi->name << " = " << std::dec << (unsigned)val << ";" << std::endl;
+			file << "\t\tstatic constexpr unsigned char " << safeName << " = " << std::dec << (unsigned)val << ";" << std::endl;
 		}
 		else if (!strcmp(fixedName, "double"))
 		{
 			double val = SafeReadDouble(fieldAddr);
-			file << "\t\tstatic constexpr double " << fi->name << " = " << std::defaultfloat << val << ";" << std::endl;
+			file << "\t\tstatic constexpr double " << safeName << " = " << std::defaultfloat << val << ";" << std::endl;
 		}
 		// Skip pointers, arrays, structs - can't constexpr those
 	}
@@ -1297,9 +1446,10 @@ void ClassInfoManager::DumpVMTHookHelper(ClassInfo* c, std::ofstream& file)
 		return;
 
 	file << std::endl;
-	file << "\t// --- VMT Hook Helper ---" << std::endl;
+	file << "\t// --- VMT Hook Helpers ---" << std::endl;
+	file << "\t// In-place hooking (modifies shared .rdata across all instances)" << std::endl;
 	file << "\ttemplate<typename T>" << std::endl;
-	file << "\tstatic T HookVFunc(void* instance, int index, T newFunc) {" << std::endl;
+	file << "\tstatic T HookVFunc_InPlace(void* instance, int index, T newFunc) {" << std::endl;
 	file << "\t\tvoid** vtable = *(void***)instance;" << std::endl;
 	file << "\t\tDWORD oldProtect;" << std::endl;
 	file << "\t\tVirtualProtect(&vtable[index], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);" << std::endl;
@@ -1307,11 +1457,28 @@ void ClassInfoManager::DumpVMTHookHelper(ClassInfo* c, std::ofstream& file)
 	file << "\t\tvtable[index] = (void*)newFunc;" << std::endl;
 	file << "\t\tVirtualProtect(&vtable[index], sizeof(void*), oldProtect, &oldProtect);" << std::endl;
 	file << "\t\treturn original;" << std::endl;
+	file << "\t}" << std::endl << std::endl;
+
+	file << "\t// Shadow VMT hooking (per-instance safe, does not modify read-only .rdata)" << std::endl;
+	file << "\ttemplate<typename T>" << std::endl;
+	file << "\tstatic T HookVFunc_Shadow(void* instance, int index, T newFunc, int totalMethods = " << it->second.entryCount << ") {" << std::endl;
+	file << "\t\tvoid** originalVTable = *(void***)instance;" << std::endl;
+	file << "\t\tvoid** shadowVTable = new void*[totalMethods];" << std::endl;
+	file << "\t\tmemcpy(shadowVTable, originalVTable, sizeof(void*) * totalMethods);" << std::endl;
+	file << "\t\tT original = (T)originalVTable[index];" << std::endl;
+	file << "\t\tshadowVTable[index] = (void*)newFunc;" << std::endl;
+	file << "\t\t*(void***)instance = shadowVTable;" << std::endl;
+	file << "\t\treturn original;" << std::endl;
+	file << "\t}" << std::endl << std::endl;
+
+	file << "\ttemplate<typename T>" << std::endl;
+	file << "\tstatic T HookVFunc(void* instance, int index, T newFunc) {" << std::endl;
+	file << "\t\treturn HookVFunc_InPlace(instance, index, newFunc);" << std::endl;
 	file << "\t}" << std::endl;
 }
 
 // ============================================================================
-// Offset Constants (unchanged)
+// Offset Constants
 // ============================================================================
 
 void ClassInfoManager::DumpOffsetConstants(std::ofstream& file, std::vector<FieldInfo*>& members)
@@ -1319,12 +1486,15 @@ void ClassInfoManager::DumpOffsetConstants(std::ofstream& file, std::vector<Fiel
 	if (members.empty()) return;
 	file << "\tstruct Offsets {" << std::endl;
 	for (auto fi : members)
-		file << "\t\tstatic constexpr size_t " << fi->name << " = 0x" << std::hex << fi->offset << ";" << std::endl;
+	{
+		std::string safeName = SanitizeMemberName(fi->name ? fi->name : "unk");
+		file << "\t\tstatic constexpr size_t " << safeName << " = 0x" << std::hex << fi->offset << ";" << std::endl;
+	}
 	file << "\t};" << std::endl;
 }
 
 // ============================================================================
-// Getter/Setter Generation (unchanged)
+// Getter/Setter Generation
 // ============================================================================
 
 void ClassInfoManager::DumpGetterSetters(std::ofstream& file, std::vector<FieldInfo*>& members, TypeInfo* ti)
@@ -1339,38 +1509,39 @@ void ClassInfoManager::DumpGetterSetters(std::ofstream& file, std::vector<FieldI
 		TypeInfo* mti = fti->typeInfo;
 		if (!IsValidPointer(mti)) continue;
 		const char* fn = GetFixedClassName(mti->name);
+		std::string safeName = SanitizeMemberName(fi->name ? fi->name : "unk");
 
 		if (mti->flags == kType_Pointer)
 		{
-			file << "\t" << fn << "* Get" << fi->name << "() const { return m_" << fi->name << "; }" << std::endl;
-			file << "\tvoid Set" << fi->name << "(" << fn << "* value) { m_" << fi->name << " = value; }" << std::endl;
+			file << "\t" << fn << "* Get" << safeName << "() const { return m_" << safeName << "; }" << std::endl;
+			file << "\tvoid Set" << safeName << "(" << fn << "* value) { m_" << safeName << " = value; }" << std::endl;
 		}
 		else if (mti->flags == kType_Array)
 		{
 			TypeInfo* ati = (mti->enumFields && IsValidPointer(mti->enumFields)) ? *(TypeInfo**)mti->enumFields : nullptr;
 			if (!IsValidPointer(ati)) continue;
 			if (ati->flags == kType_Pointer)
-				file << "\tArray<" << GetFixedClassName(ati->name) << "*>& Get" << fi->name << "() { return m_" << fi->name << "; }" << std::endl;
+				file << "\tArray<" << GetFixedClassName(ati->name) << "*>& Get" << safeName << "() { return m_" << safeName << "; }" << std::endl;
 			else
-				file << "\tArray<" << GetFixedClassName(ati->name) << ">& Get" << fi->name << "() { return m_" << fi->name << "; }" << std::endl;
+				file << "\tArray<" << GetFixedClassName(ati->name) << ">& Get" << safeName << "() { return m_" << safeName << "; }" << std::endl;
 		}
 		else if (!strcmp(fn, "const char*"))
 		{
-			file << "\tconst char* Get" << fi->name << "() const { return m_" << fi->name << "; }" << std::endl;
-			file << "\tvoid Set" << fi->name << "(const char* value) { m_" << fi->name << " = value; }" << std::endl;
+			file << "\tconst char* Get" << safeName << "() const { return m_" << safeName << "; }" << std::endl;
+			file << "\tvoid Set" << safeName << "(const char* value) { m_" << safeName << " = value; }" << std::endl;
 		}
 		else if (!strcmp(fn, "bool") || !strcmp(fn, "float") || !strcmp(fn, "double") ||
 			!strcmp(fn, "int") || !strcmp(fn, "short") || !strcmp(fn, "long") || !strcmp(fn, "char") ||
 			!strcmp(fn, "unsigned int") || !strcmp(fn, "unsigned short") || !strcmp(fn, "unsigned long") || !strcmp(fn, "unsigned char"))
 		{
-			file << "\t" << fn << " Get" << fi->name << "() const { return m_" << fi->name << "; }" << std::endl;
-			file << "\tvoid Set" << fi->name << "(" << fn << " value) { m_" << fi->name << " = value; }" << std::endl;
+			file << "\t" << fn << " Get" << safeName << "() const { return m_" << safeName << "; }" << std::endl;
+			file << "\tvoid Set" << safeName << "(" << fn << " value) { m_" << safeName << " = value; }" << std::endl;
 		}
 		else
 		{
-			file << "\t" << fn << "& Get" << fi->name << "() { return m_" << fi->name << "; }" << std::endl;
-			file << "\tconst " << fn << "& Get" << fi->name << "() const { return m_" << fi->name << "; }" << std::endl;
-			file << "\tvoid Set" << fi->name << "(const " << fn << "& value) { m_" << fi->name << " = value; }" << std::endl;
+			file << "\t" << fn << "& Get" << safeName << "() { return m_" << safeName << "; }" << std::endl;
+			file << "\tconst " << fn << "& Get" << safeName << "() const { return m_" << safeName << "; }" << std::endl;
+			file << "\tvoid Set" << safeName << "(const " << fn << "& value) { m_" << safeName << " = value; }" << std::endl;
 		}
 	}
 }
@@ -1400,6 +1571,7 @@ void ClassInfoManager::DumpTemplateClass(ClassInfo* c)
 	file << std::endl << "#ifndef FBGEN_" << sanitizedName << "_H" << std::endl;
 	file << "#define FBGEN_" << sanitizedName << "_H" << std::endl << std::endl;
 	file << "#include \"FBSDKTypes.h\"" << std::endl;
+	file << "#include \"FBClasses.h\"" << std::endl;
 
 	std::vector<FieldInfo*> members;
 	ParseClassMembers(ti, members);
@@ -1683,14 +1855,14 @@ void ClassInfoManager::GenerateJSONSchema()
 		if (!firstClass) file << "," << std::endl;
 		firstClass = false;
 
-		file << "    \"" << ti->name << "\": {" << std::endl;
+		file << "    \"" << EscapeJson(ti->name) << "\": {" << std::endl;
 		file << "      \"size\": " << std::dec << ti->totalSize << "," << std::endl;
 		file << "      \"typeInfoOffset\": \"0x" << std::hex << ((uintptr_t)c - m_moduleBase) << "\"," << std::endl;
 		file << "      \"isDataContainer\": " << (c->isDataContainer ? "true" : "false") << "," << std::endl;
 
 		// Parent
 		if (c->parent && IsValidPointer(c->parent) && c->parent != c && IsValidPointer(c->parent->typeInfo) && c->parent->typeInfo && IsValidPointer((void*)c->parent->typeInfo->name) && c->parent->typeInfo->name)
-			file << "      \"parent\": \"" << c->parent->typeInfo->name << "\"," << std::endl;
+			file << "      \"parent\": \"" << EscapeJson(c->parent->typeInfo->name) << "\"," << std::endl;
 		else
 			file << "      \"parent\": null," << std::endl;
 
@@ -1703,7 +1875,7 @@ void ClassInfoManager::GenerateJSONSchema()
 			{
 				if (i > 0) file << ", ";
 				file << "{\"offset\": " << std::dec << travIt->second.steps[i].offset
-					<< ", \"field\": \"" << travIt->second.steps[i].fieldName << "\"}";
+					<< ", \"field\": \"" << EscapeJson(travIt->second.steps[i].fieldName) << "\"}";
 			}
 			file << "]," << std::endl;
 		}
@@ -1734,7 +1906,8 @@ void ClassInfoManager::GenerateJSONSchema()
 					if (!firstMember) file << ", ";
 					firstMember = false;
 					
-					file << "{\"name\": \"" << (fie->name && IsValidPointer(fie->name) ? fie->name : "unk") << "\""
+					const char* mName = (fie->name && IsValidPointer(fie->name) ? fie->name : "unk");
+					file << "{\"name\": \"" << EscapeJson(mName) << "\""
 						<< ", \"value\": " << std::dec << fie->value << "}";
 				}
 			}
@@ -1767,9 +1940,9 @@ void ClassInfoManager::GenerateJSONSchema()
 							typeStr = "Array<" + typeStr + ">";
 					}
 
-					file << "{\"name\": \"" << fd.name << "\""
+					file << "{\"name\": \"" << EscapeJson(fd.name) << "\""
 						<< ", \"offset\": " << std::dec << fd.offset
-						<< ", \"type\": \"" << typeStr << "\""
+						<< ", \"type\": \"" << EscapeJson(typeStr) << "\""
 						<< ", \"size\": " << std::dec << fd.size
 						<< "}";
 				}
@@ -2075,6 +2248,7 @@ void ClassInfoManager::GenerateFBSDKTypes()
 	file << "#pragma once" << std::endl << std::endl;
 	file << "#include <cstdint>" << std::endl;
 	file << "#include <cstring>" << std::endl;
+	file << "#include <type_traits>" << std::endl;
 	file << "#include <initializer_list>" << std::endl;
 	file << "#include <Windows.h>" << std::endl << std::endl;
 
@@ -2087,6 +2261,7 @@ void ClassInfoManager::GenerateFBSDKTypes()
 
 	file << "template <typename T>" << std::endl;
 	file << "inline T Read(uintptr_t address) {" << std::endl;
+	file << "\tstatic_assert(std::is_trivially_copyable_v<T>, \"fb::Read<T> requires trivially copyable T\");" << std::endl;
 	file << "\tT buffer{};" << std::endl;
 	file << "\t__try { memcpy(&buffer, (void*)address, sizeof(T)); } __except(EXCEPTION_EXECUTE_HANDLER) {}" << std::endl;
 	file << "\treturn buffer;" << std::endl;
@@ -2128,10 +2303,11 @@ void ClassInfoManager::GenerateFBSDKTypes()
 	file << "\treturn ptr != nullptr && (uintptr_t)ptr > 0x10000 && (uintptr_t)ptr < 0x00007FFFFFFFFFFF;" << std::endl;
 	file << "}" << std::endl << std::endl;
 
-	file << "template<typename T> inline void Write(uintptr_t address, T value) {" << std::endl;
+	file << "template<typename T> inline void Write(uintptr_t address, const T& value) {" << std::endl;
+	file << "\tstatic_assert(std::is_trivially_copyable_v<T>, \"fb::Write<T> requires trivially copyable T\");" << std::endl;
 	file << "\tif (!IsValidPtr((void*)address)) return;" << std::endl;
-	file << "\t__try { *reinterpret_cast<T*>(address) = value; }" << std::endl;
-	file << "\t__except(1) {}" << std::endl;
+	file << "\t__try { memcpy((void*)address, &value, sizeof(T)); }" << std::endl;
+	file << "\t__except(EXCEPTION_EXECUTE_HANDLER) {}" << std::endl;
 	file << "}" << std::endl << std::endl;
 
 	file << "template<typename T> inline T ReadPtr(uintptr_t address) {" << std::endl;
@@ -2220,12 +2396,14 @@ void ClassInfoManager::ScanGlobalsForSingletons()
                             TraversalChain rootChain;
                             rootChain.targetClass = name;
                             rootChain.resolvedAddress = (uintptr_t)obj;
+                            rootChain.rootClassName = name;
+                            rootChain.rootGlobalOffset = ptr - m_moduleBase;
                             m_traversalMap[name] = rootChain;
                             
                             std::vector<TraversalStep> chain;
                             std::set<uintptr_t> visited;
                             visited.insert((uintptr_t)obj);
-                            BuildTraversalMap((uintptr_t)obj, id, 1, chain, visited);
+                            BuildTraversalMap((uintptr_t)obj, id, 1, chain, visited, ptr - m_moduleBase, name);
                         }
                     }
                 }
@@ -2269,7 +2447,7 @@ void ClassInfoManager::DumpLiveInstances()
 		if (!IsValidPointer((void*)instance)) continue;
 		
 		if (!firstSingleton) file << "," << std::endl;
-		file << "  \"" << pair.first << "\": \"0x" << std::hex << instance << "\"";
+		file << "  \"" << EscapeJson(pair.first) << "\": \"0x" << std::hex << instance << "\"";
 		firstSingleton = false;
 	}
 	
@@ -2300,12 +2478,27 @@ void ClassInfoManager::GenerateCheatEngineTable()
 		char nameBuf[256] = {0};
 		if (!ti || !IsValidPointer((void*)ti->name) || !SafeReadString((uintptr_t)ti->name, nameBuf, sizeof(nameBuf)) || nameBuf[0] == 0) continue;
 
-		std::string className = GetSanitizedClassName(nameBuf);
+		std::string className = EscapeXml(GetSanitizedClassName(nameBuf));
 		file << "    <Structure Name=\"" << className << "\" AutoFill=\"0\" AutoCreate=\"1\" DefaultHex=\"0\" AutoDestroy=\"0\" DoNotSaveLocal=\"0\" RLECompression=\"1\" AutoCreateStructsize=\"4096\">\n";
 		file << "      <Elements>\n";
 
 		std::vector<FieldInfo*> members;
-		ParseClassMembers(ti, members);
+		FieldInfo* fields = GetFieldsArray(ti);
+		if (IsValidPointer(fields))
+		{
+			int fieldCount = SafeReadUInt16((uintptr_t)&ti->fieldCount);
+			if (fieldCount > 0 && fieldCount <= 10000)
+			{
+				for (int i = 0; i < fieldCount; ++i)
+				{
+					FieldInfo* fi = &fields[i];
+					if (SafeValidateFieldInfo(fi))
+						members.push_back(fi);
+				}
+				auto cmp = [](const FieldInfo* a, const FieldInfo* b) { return a->offset < b->offset; };
+				std::sort(members.begin(), members.end(), cmp);
+			}
+		}
 		
 		for (FieldInfo* field : members)
 		{
@@ -2314,7 +2507,8 @@ void ClassInfoManager::GenerateCheatEngineTable()
 			unsigned short fieldOffset = SafeReadUInt16((uintptr_t)&field->offset);
 
 			char fieldBuf[256] = {0};
-			std::string fieldName = (IsValidPointer((void*)field->name) && SafeReadString((uintptr_t)field->name, fieldBuf, sizeof(fieldBuf)) && fieldBuf[0] != 0) ? fieldBuf : ("unk_" + std::to_string(fieldOffset));
+			std::string rawFieldName = (IsValidPointer((void*)field->name) && SafeReadString((uintptr_t)field->name, fieldBuf, sizeof(fieldBuf)) && fieldBuf[0] != 0) ? fieldBuf : ("unk_" + std::to_string(fieldOffset));
+			std::string fieldName = EscapeXml(rawFieldName);
 
 			int size = field->GetFieldSize();
 			std::string ceType = "4 Bytes";

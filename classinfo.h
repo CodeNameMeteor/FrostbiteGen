@@ -16,11 +16,13 @@ struct TraversalStep
 	std::string typeName;    // declared target type name
 };
 
-/// Full chain from ClientGameContext to a specific class instance.
+/// Full chain from ClientGameContext or a global singleton to a specific class instance.
 struct TraversalChain
 {
 	std::string targetClass;             // class we're reaching
-	std::vector<TraversalStep> steps;    // steps from ClientGameContext
+	std::string rootClassName;           // root class name (e.g., "ClientGameContext" or "ResourceManager")
+	uintptr_t rootGlobalOffset;          // module-relative offset of the root singleton pointer
+	std::vector<TraversalStep> steps;    // steps from root singleton
 	uintptr_t resolvedAddress;           // live instance address (at generation time)
 };
 
@@ -44,8 +46,12 @@ public:
 	void DumpClasses();
 	void DumpLiveInstances();
 
+	static std::string SanitizeMemberName(const std::string& orig);
+	static std::string EscapeXml(const std::string& s);
+	static std::string EscapeJson(const std::string& s);
+
 private:
-	// --- Existing Methods (unchanged) ---
+	// --- Existing Methods ---
 	std::vector<ClassInfo*> GetParents(ClassInfo* c);
 	void	DumpClass(ClassInfo* c);
 	int		DumpClassMembers(std::ofstream& file, std::vector<FieldInfo*>& members, int parentSize);
@@ -67,7 +73,7 @@ private:
 	void	DumpOffsetConstants(std::ofstream& file, std::vector<FieldInfo*>& members);
 	void	DumpGetterSetters(std::ofstream& file, std::vector<FieldInfo*>& members, TypeInfo* ti);
 
-	// --- P0: Instance Resolution (ClientGameContext traversal) ---
+	// --- P0: Instance Resolution (ClientGameContext & singleton traversal) ---
 
 	/// Pattern-scans for the ClientGameContext singleton pointer.
 	/// Tries multiple known FB3 patterns and validates each match.
@@ -76,31 +82,33 @@ private:
 	uintptr_t FindClientGameContext();
 
 	/// Recursively walks pointer fields starting from a known object,
-	/// building the traversal map (class name â†’ chain of offsets).
+	/// building the traversal map (class name -> chain of offsets).
 	void BuildTraversalMap(uintptr_t instanceAddr, ClassInfo* classInfo,
 		int depth, std::vector<TraversalStep>& currentChain,
-		std::set<uintptr_t>& visited);
+		std::set<uintptr_t>& visited,
+		uintptr_t rootGlobalOffset = 0, const std::string& rootClassName = "ClientGameContext");
 
 	/// Walks every 8-byte offset in an object blindly (no ClassInfo needed).
 	/// For each valid sub-pointer, tries to identify the class via vtable
 	/// analysis, then recurses with normal BuildTraversalMap if identified.
 	void BlindTraversalWalk(uintptr_t objectAddr, int depth,
 		std::vector<TraversalStep>& currentChain,
-		std::set<uintptr_t>& visited);
+		std::set<uintptr_t>& visited,
+		uintptr_t rootGlobalOffset = 0, const std::string& rootClassName = "ClientGameContext");
 
 	/// Tries to identify a live object's class by analyzing its vtable.
 	/// Checks vtable entries for GetType()-style functions that reference
 	/// a known TypeInfo address. Returns the ClassInfo* if found, nullptr otherwise.
 	ClassInfo* TryIdentifyClassByVTable(uintptr_t instanceAddr, bool verbose = false);
 
-	/// Emits GetInstance() that uses fb::ReadChain to traverse from
-	/// ClientGameContext. Replaces the old ClassInfo-probing approach.
+	/// Emits GetInstance() that uses fb::Read to traverse from
+	/// ClientGameContext or discovered global singleton.
 	void DumpInstanceResolver(ClassInfo* c, std::ofstream& file);
 
 	// --- P1: Pointer Chain Documentation ---
 
 	/// Emits a comment block documenting the exact offset chain from
-	/// ClientGameContext to this class's instance.
+	/// the root singleton to this class's instance.
 	void DumpTraversalChainComment(ClassInfo* c, std::ofstream& file);
 
 	// --- P1: Default Value Snapshots ---
@@ -141,7 +149,6 @@ private:
 	void GenerateBonusOutputs();
 	
 	// --- P4: Additional Bonus Outputs ---
-	void GenerateReClassProject();
 	void GenerateCheatEngineTable();
 
 private:

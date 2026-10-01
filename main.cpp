@@ -130,6 +130,7 @@ DWORD WINAPI GeneratorThread(LPVOID lpParam)
 	{
 		Log("ERROR: Failed to find ClassInfo instance");
 		MessageBox(0, "Failed to find ClassInfo", "FrostbiteGen", MB_ICONERROR);
+		FreeLibraryAndExitThread(hModule, 1);
 		return 1;
 	}
 
@@ -142,6 +143,8 @@ DWORD WINAPI GeneratorThread(LPVOID lpParam)
 	Log("SDK generation complete!");
 	MessageBox(0, "SDK generated successfully!\nCheck the SDK\\ folder for output.", "FrostbiteGen", MB_ICONINFORMATION);
 
+	// Automatically unload the DLL to release disk locks and allow immediate recompilation
+	FreeLibraryAndExitThread(hModule, 0);
 	return 0;
 }
 

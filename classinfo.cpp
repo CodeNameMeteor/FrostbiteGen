@@ -285,6 +285,7 @@ void ClassInfoManager::GenerateBonusOutputs()
 	__try { GenerateCrossRefFile(); } __except(1) { Log("Crash in GenerateCrossRefFile"); }
 	__try { DumpLiveInstances(); } __except(1) { Log("Crash in DumpLiveInstances"); }
 	__try { GenerateCheatEngineTable(); } __except(1) { Log("Crash in GenerateCheatEngineTable"); }
+	__try { DumpConsoleVariables(); } __except(1) { Log("Crash in DumpConsoleVariables"); }
 }
 
 // ============================================================================
@@ -627,101 +628,211 @@ void ClassInfoManager::BuildTraversalMap(uintptr_t instanceAddr, ClassInfo* clas
 	int depth, std::vector<TraversalStep>& currentChain, std::set<uintptr_t>& visited,
 	uintptr_t rootGlobalOffset, const std::string& rootClassName)
 {
-	if (depth > 5 || !classInfo || !classInfo->typeInfo)
-		return;
-
-	TypeInfo* ti = classInfo->typeInfo;
-	if (!ti->fields || ti->fieldCount == 0)
+	if (depth > 5 || !classInfo || !IsValidPointer(classInfo) || !classInfo->typeInfo || !IsValidPointer(classInfo->typeInfo))
 		return;
 
 	uintptr_t effectiveRootOffset = rootGlobalOffset != 0 ? rootGlobalOffset : m_clientGameCtxGlobalOffset;
 	std::string effectiveRootClass = rootClassName.empty() ? "ClientGameContext" : rootClassName;
 
-	// Walk this class's pointer fields
-	for (int i = 0; i < ti->fieldCount; ++i)
+	// Iteratively collect this class and its parents with cycle detection (prevents stack overflow)
+	std::vector<ClassInfo*> classesToWalk;
+	classesToWalk.push_back(classInfo);
+	std::vector<ClassInfo*> parents = GetParents(classInfo);
+	classesToWalk.insert(classesToWalk.end(), parents.begin(), parents.end());
+
+	for (ClassInfo* currCI : classesToWalk)
 	{
-		FieldInfo* fi = &ti->fields[i];
-		if (!fi || !fi->typeInfo || !fi->typeInfo->typeInfo)
+		if (!currCI || !IsValidPointer(currCI) || !currCI->typeInfo || !IsValidPointer(currCI->typeInfo))
 			continue;
 
-		TypeInfo* fieldType = fi->typeInfo->typeInfo;
-
-		// Only follow pointer fields
-		if (fieldType->flags != kType_Pointer)
+		TypeInfo* ti = currCI->typeInfo;
+		if (!ti->fields || !IsValidPointer(ti->fields))
 			continue;
 
-		if (!fieldType->name)
+		int fieldCount = SafeReadUInt16((uintptr_t)&ti->fieldCount);
+		if (fieldCount <= 0 || fieldCount > 1000)
 			continue;
 
-		std::string targetName = fieldType->name;
-
-		// Read the live pointer value
-		void* fieldPtr = SafeReadPointer(instanceAddr + fi->offset);
-		if (!fieldPtr || !IsValidPointer(fieldPtr))
-			continue;
-
-		// Validate: the target should have a vtable in the module
-		void* targetVtable = SafeReadPointer((uintptr_t)fieldPtr);
-		if (!targetVtable || !IsModulePointer(targetVtable, m_moduleBase, m_moduleEnd))
-			continue;
-
-		// Prevent infinite loops
-		if (visited.count((uintptr_t)fieldPtr))
-			continue;
-
-		// Build the chain to this target
-		TraversalStep step;
-		step.offset = fi->offset;
-		step.fieldName = fi->name ? fi->name : "unknown";
-		step.typeName = targetName;
-
-		std::vector<TraversalStep> newChain = currentChain;
-		newChain.push_back(step);
-
-		// Store in traversal map (prefer shorter chains)
-		auto existing = m_traversalMap.find(targetName);
-		if (existing == m_traversalMap.end() || newChain.size() < existing->second.steps.size())
+		// Walk this class's fields
+		for (int i = 0; i < fieldCount; ++i)
 		{
-			TraversalChain chain;
-			chain.targetClass = targetName;
-			chain.rootClassName = effectiveRootClass;
-			chain.rootGlobalOffset = effectiveRootOffset;
-			chain.steps = newChain;
-			chain.resolvedAddress = (uintptr_t)fieldPtr;
-			m_traversalMap[targetName] = chain;
+			FieldInfo* fi = &ti->fields[i];
+			if (!fi || !IsValidPointer(fi) || !fi->typeInfo || !IsValidPointer(fi->typeInfo))
+				continue;
 
-			Log("  Traversal: %s @ depth %d, offset chain length %d, addr 0x%016llX (via %s)",
-				targetName.c_str(), depth, (int)newChain.size(), (uintptr_t)fieldPtr, effectiveRootClass.c_str());
+			TypeInfo* fieldType = fi->typeInfo->typeInfo;
+			if (!fieldType || !IsValidPointer(fieldType))
+				continue;
 
-			// Capture vtable info for this instance
-			int vtableCount = SafeCountVTableEntries(fieldPtr, m_moduleBase, m_moduleEnd);
-			if (vtableCount > 0)
+			// Follow pointer fields OR arrays of pointers (fb::Array<T*>)
+			if (fieldType->flags == kType_Array)
 			{
-				VTableInfo vti;
-				vti.entryCount = vtableCount;
-				for (int v = 0; v < vtableCount; v++)
+				TypeInfo* ati = nullptr;
+				if (fieldType->enumFields && IsValidPointer(fieldType->enumFields))
 				{
-					uintptr_t entry = SafeReadVTableEntry(fieldPtr, v);
-					vti.entries.push_back(entry > 0 ? entry - m_moduleBase : 0);
+					ati = (TypeInfo*)SafeReadPointer((uintptr_t)fieldType->enumFields);
 				}
-				m_vtableMap[targetName] = vti;
+				if (ati && IsValidPointer(ati))
+				{
+					unsigned short atiFlags = SafeReadUInt16((uintptr_t)&ati->flags);
+					char elemTypeNameBuf[128] = {0};
+					if (atiFlags == kType_Pointer && SafeReadString((uintptr_t)ati->name, elemTypeNameBuf, sizeof(elemTypeNameBuf)) && elemTypeNameBuf[0] != 0)
+					{
+						std::string elemTypeName = elemTypeNameBuf;
+						uintptr_t arrayAddr = instanceAddr + fi->offset;
+						void* firstElem = SafeReadPointer(arrayAddr);
+						void* lastElem  = SafeReadPointer(arrayAddr + 8);
+						if (firstElem && lastElem && (uintptr_t)lastElem >= (uintptr_t)firstElem)
+						{
+							size_t elemCount = ((uintptr_t)lastElem - (uintptr_t)firstElem) / sizeof(void*);
+							if (elemCount > 0 && elemCount < 256)
+							{
+								void* elemPtr = SafeReadPointer((uintptr_t)firstElem);
+								if (elemPtr && IsValidPointer(elemPtr))
+								{
+									void* elemVtable = SafeReadPointer((uintptr_t)elemPtr);
+									if (elemVtable && IsModulePointer(elemVtable, m_moduleBase, m_moduleEnd))
+									{
+										if (!visited.count((uintptr_t)elemPtr))
+										{
+											char fiNameBuf[128] = {0};
+											std::string fiName = (SafeReadString((uintptr_t)fi->name, fiNameBuf, sizeof(fiNameBuf)) && fiNameBuf[0] != 0) ? fiNameBuf : "unk";
+											TraversalStep step;
+											step.offset = fi->offset;
+											step.fieldName = fiName + "[0]";
+											step.typeName = elemTypeName;
+
+											std::vector<TraversalStep> newChain = currentChain;
+											newChain.push_back(step);
+
+											auto existing = m_traversalMap.find(elemTypeName);
+											if (existing == m_traversalMap.end() || newChain.size() < existing->second.steps.size())
+											{
+												TraversalChain chain;
+												chain.targetClass = elemTypeName;
+												chain.rootClassName = effectiveRootClass;
+												chain.rootGlobalOffset = effectiveRootOffset;
+												chain.steps = newChain;
+												chain.resolvedAddress = (uintptr_t)elemPtr;
+												m_traversalMap[elemTypeName] = chain;
+
+												Log("  Traversal (via array): %s @ depth %d, addr 0x%016llX (via %s)",
+													elemTypeName.c_str(), depth, (uintptr_t)elemPtr, effectiveRootClass.c_str());
+
+												int vtableCount = SafeCountVTableEntries(elemPtr, m_moduleBase, m_moduleEnd);
+												if (vtableCount > 0)
+												{
+													VTableInfo vti;
+													vti.entryCount = vtableCount;
+													auto targetElemClassIt = m_classMap.find(elemTypeName);
+													ClassInfo* elemCI = targetElemClassIt != m_classMap.end() ? targetElemClassIt->second : nullptr;
+													for (int v = 0; v < vtableCount; v++)
+													{
+														uintptr_t entry = SafeReadVTableEntry(elemPtr, v);
+														vti.entries.push_back(entry > 0 ? entry - m_moduleBase : 0);
+														if (entry > 0)
+															vti.methods.push_back(AnalyzeVTableMethod(elemCI, v, entry));
+													}
+													m_vtableMap[elemTypeName] = vti;
+												}
+											}
+
+											visited.insert((uintptr_t)elemPtr);
+											auto targetElemClassIt = m_classMap.find(elemTypeName);
+											if (targetElemClassIt != m_classMap.end())
+											{
+												BuildTraversalMap((uintptr_t)elemPtr, targetElemClassIt->second,
+													depth + 1, newChain, visited, effectiveRootOffset, effectiveRootClass);
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				continue;
+			}
+
+			// Only follow pointer fields
+			if (fieldType->flags != kType_Pointer)
+				continue;
+
+			char targetNameBuf[128] = {0};
+			if (!SafeReadString((uintptr_t)fieldType->name, targetNameBuf, sizeof(targetNameBuf)) || targetNameBuf[0] == 0)
+				continue;
+
+			std::string targetName = targetNameBuf;
+
+			// Read the live pointer value
+			void* fieldPtr = SafeReadPointer(instanceAddr + fi->offset);
+			if (!fieldPtr || !IsValidPointer(fieldPtr))
+				continue;
+
+			// Validate: the target should have a vtable in the module
+			void* targetVtable = SafeReadPointer((uintptr_t)fieldPtr);
+			if (!targetVtable || !IsModulePointer(targetVtable, m_moduleBase, m_moduleEnd))
+				continue;
+
+			// Prevent infinite loops
+			if (visited.count((uintptr_t)fieldPtr))
+				continue;
+
+			// Build the chain to this target
+			char fiNameBuf[128] = {0};
+			std::string fieldNameStr = (SafeReadString((uintptr_t)fi->name, fiNameBuf, sizeof(fiNameBuf)) && fiNameBuf[0] != 0) ? fiNameBuf : "unknown";
+
+			TraversalStep step;
+			step.offset = fi->offset;
+			step.fieldName = fieldNameStr;
+			step.typeName = targetName;
+
+			std::vector<TraversalStep> newChain = currentChain;
+			newChain.push_back(step);
+
+			// Store in traversal map (prefer shorter chains)
+			auto existing = m_traversalMap.find(targetName);
+			if (existing == m_traversalMap.end() || newChain.size() < existing->second.steps.size())
+			{
+				TraversalChain chain;
+				chain.targetClass = targetName;
+				chain.rootClassName = effectiveRootClass;
+				chain.rootGlobalOffset = effectiveRootOffset;
+				chain.steps = newChain;
+				chain.resolvedAddress = (uintptr_t)fieldPtr;
+				m_traversalMap[targetName] = chain;
+
+				Log("  Traversal: %s @ depth %d, offset chain length %d, addr 0x%016llX (via %s)",
+					targetName.c_str(), depth, (int)newChain.size(), (uintptr_t)fieldPtr, effectiveRootClass.c_str());
+
+				// Capture vtable info for this instance
+				int vtableCount = SafeCountVTableEntries(fieldPtr, m_moduleBase, m_moduleEnd);
+				if (vtableCount > 0)
+				{
+					VTableInfo vti;
+					vti.entryCount = vtableCount;
+					auto targetClassIt = m_classMap.find(targetName);
+					ClassInfo* targetCI = targetClassIt != m_classMap.end() ? targetClassIt->second : nullptr;
+					for (int v = 0; v < vtableCount; v++)
+					{
+						uintptr_t entry = SafeReadVTableEntry(fieldPtr, v);
+						vti.entries.push_back(entry > 0 ? entry - m_moduleBase : 0);
+						if (entry > 0)
+							vti.methods.push_back(AnalyzeVTableMethod(targetCI, v, entry));
+					}
+					m_vtableMap[targetName] = vti;
+				}
+			}
+
+			// Recurse into this object's fields
+			visited.insert((uintptr_t)fieldPtr);
+			auto targetClassIt = m_classMap.find(targetName);
+			if (targetClassIt != m_classMap.end())
+			{
+				BuildTraversalMap((uintptr_t)fieldPtr, targetClassIt->second,
+					depth + 1, newChain, visited, effectiveRootOffset, effectiveRootClass);
 			}
 		}
-
-		// Recurse into this object's fields
-		visited.insert((uintptr_t)fieldPtr);
-		auto targetClassIt = m_classMap.find(targetName);
-		if (targetClassIt != m_classMap.end())
-		{
-			BuildTraversalMap((uintptr_t)fieldPtr, targetClassIt->second,
-				depth + 1, newChain, visited, effectiveRootOffset, effectiveRootClass);
-		}
-	}
-
-	// Also walk parent class fields
-	if (classInfo->parent && classInfo->parent != classInfo)
-	{
-		BuildTraversalMap(instanceAddr, classInfo->parent, depth, currentChain, visited, effectiveRootOffset, effectiveRootClass);
 	}
 }
 
@@ -856,6 +967,7 @@ void ClassInfoManager::BlindTraversalWalk(uintptr_t objectAddr, int depth,
 					{
 						uintptr_t entry = SafeReadVTableEntry(ptr, v);
 						vti.entries.push_back(entry > 0 ? entry - m_moduleBase : 0);
+						vti.methods.push_back(AnalyzeVTableMethod(identifiedClass, v, entry));
 					}
 					m_vtableMap[targetName] = vti;
 				}
@@ -1048,6 +1160,31 @@ void ClassInfoManager::DumpEnum(ClassInfo* c)
 	file << "{" << std::endl;
 	DumpEnumMembers(file, ti);
 	file << "};" << std::endl << std::endl;
+
+	// Bitwise operator overloads for flags / masks
+	file << "// Bitwise operators for " << ti->name << std::endl;
+	file << "inline constexpr " << ti->name << " operator|(" << ti->name << " a, " << ti->name << " b) {" << std::endl;
+	file << "\treturn static_cast<" << ti->name << ">(static_cast<int>(a) | static_cast<int>(b));" << std::endl;
+	file << "}" << std::endl;
+	file << "inline constexpr " << ti->name << " operator&(" << ti->name << " a, " << ti->name << " b) {" << std::endl;
+	file << "\treturn static_cast<" << ti->name << ">(static_cast<int>(a) & static_cast<int>(b));" << std::endl;
+	file << "}" << std::endl;
+	file << "inline constexpr " << ti->name << " operator^(" << ti->name << " a, " << ti->name << " b) {" << std::endl;
+	file << "\treturn static_cast<" << ti->name << ">(static_cast<int>(a) ^ static_cast<int>(b));" << std::endl;
+	file << "}" << std::endl;
+	file << "inline constexpr " << ti->name << " operator~(" << ti->name << " a) {" << std::endl;
+	file << "\treturn static_cast<" << ti->name << ">(~static_cast<int>(a));" << std::endl;
+	file << "}" << std::endl;
+	file << "inline " << ti->name << "& operator|=(" << ti->name << "& a, " << ti->name << " b) {" << std::endl;
+	file << "\treturn a = a | b;" << std::endl;
+	file << "}" << std::endl;
+	file << "inline " << ti->name << "& operator&=(" << ti->name << "& a, " << ti->name << " b) {" << std::endl;
+	file << "\treturn a = a & b;" << std::endl;
+	file << "}" << std::endl;
+	file << "inline " << ti->name << "& operator^=(" << ti->name << "& a, " << ti->name << " b) {" << std::endl;
+	file << "\treturn a = a ^ b;" << std::endl;
+	file << "}" << std::endl << std::endl;
+
 	file << "#endif // FBGEN_" << c->typeInfo->name << "_H" << std::endl;
 
 	file.close();
@@ -1403,8 +1540,250 @@ void ClassInfoManager::DumpDefaultValues(ClassInfo* c, std::ofstream& file,
 }
 
 // ============================================================================
-// P2: VTable Dumping
+// P2: VTable Dumping & Micro-Disassembly Analysis
 // ============================================================================
+
+static FieldInfo* FindClassFieldByOffset(ClassInfo* c, int offset)
+{
+	ClassInfo* curr = c;
+	std::set<ClassInfo*> visited;
+	while (curr && IsValidPointer(curr) && visited.count(curr) == 0 && visited.size() < 32)
+	{
+		visited.insert(curr);
+		TypeInfo* ti = (TypeInfo*)SafeReadPointer((uintptr_t)&curr->typeInfo);
+		if (!IsValidPointer(ti)) break;
+
+		FieldInfo* fields = (FieldInfo*)SafeReadPointer((uintptr_t)&ti->fields);
+		if (fields && IsValidPointer(fields))
+		{
+			int count = SafeReadUInt16((uintptr_t)&ti->fieldCount);
+			if (count > 0 && count < 1000)
+			{
+				for (int i = 0; i < count; i++)
+				{
+					FieldInfo* fi = &fields[i];
+					if (!IsValidPointer(fi)) break;
+					unsigned short fOffset = SafeReadUInt16((uintptr_t)&fi->offset);
+					if (fOffset == offset)
+						return fi;
+				}
+			}
+		}
+		curr = (ClassInfo*)SafeReadPointer((uintptr_t)&curr->parent);
+	}
+	return nullptr;
+}
+
+VTableMethodInfo ClassInfoManager::AnalyzeVTableMethod(ClassInfo* c, int index, uintptr_t funcAddr)
+{
+	VTableMethodInfo info;
+	info.index = index;
+	info.rva = (funcAddr >= m_moduleBase && funcAddr < m_moduleEnd) ? (funcAddr - m_moduleBase) : 0;
+	info.name = "Func_" + std::to_string(index);
+	info.returnType = "void*";
+	info.paramType = "";
+	info.comment = "";
+
+	if (!funcAddr || !IsModulePointer((void*)funcAddr, m_moduleBase, m_moduleEnd))
+		return info;
+
+	unsigned char code[16] = {0};
+	if (!SafeReadBytes(funcAddr, code, sizeof(code)))
+		return info;
+
+	// Pattern 1: GetType()
+	// lea rax, [rip+disp32]; ret (48 8D 05 XX XX XX XX C3)
+	// mov rax, [rip+disp32]; ret (48 8B 05 XX XX XX XX C3)
+	if ((code[0] == 0x48 && code[1] == 0x8D && code[2] == 0x05 && code[7] == 0xC3) ||
+	    (code[0] == 0x48 && code[1] == 0x8B && code[2] == 0x05 && code[7] == 0xC3))
+	{
+		int32_t disp = *(int32_t*)&code[3];
+		uintptr_t targetAddr = funcAddr + 7 + (int64_t)disp;
+		if (code[1] == 0x8B)
+		{
+			void* deref = SafeReadPointer(targetAddr);
+			if (deref) targetAddr = (uintptr_t)deref;
+		}
+		auto it = m_typeInfoToClassMap.find(targetAddr);
+		if (it != m_typeInfoToClassMap.end() && it->second && it->second->typeInfo && it->second->typeInfo->name)
+		{
+			info.name = "GetType";
+			info.returnType = "TypeInfo*";
+			info.comment = std::string("Returns TypeInfo for ") + it->second->typeInfo->name;
+			return info;
+		}
+	}
+
+	// Pattern 2: Null / Constant stubs
+	if (code[0] == 0xC3) // ret
+	{
+		info.name = "Stub_Empty_" + std::to_string(index);
+		info.returnType = "void";
+		info.comment = "empty stub";
+		return info;
+	}
+	if ((code[0] == 0x31 && code[1] == 0xC0 && code[2] == 0xC3) || // xor eax, eax; ret
+	    (code[0] == 0x33 && code[1] == 0xC0 && code[2] == 0xC3))
+	{
+		info.name = "Stub_Return0_" + std::to_string(index);
+		info.returnType = "uint32_t";
+		info.comment = "returns 0";
+		return info;
+	}
+	if (code[0] == 0xB8 && *(int32_t*)&code[1] == 1 && code[5] == 0xC3) // mov eax, 1; ret
+	{
+		info.name = "Stub_Return1_" + std::to_string(index);
+		info.returnType = "uint32_t";
+		info.comment = "returns 1";
+		return info;
+	}
+
+	// Pattern 3: Getters & Setters
+	int fieldOffset = -1;
+	bool isGetter = false;
+	bool isSetter = false;
+	std::string detectedType = "uintptr_t";
+
+	// mov rax, [rcx] ; ret
+	if (code[0] == 0x48 && code[1] == 0x8B && code[2] == 0x01 && code[3] == 0xC3)
+	{
+		fieldOffset = 0; isGetter = true; detectedType = "void*";
+	}
+	// mov rax, [rcx + disp8] ; ret
+	else if (code[0] == 0x48 && code[1] == 0x8B && code[2] == 0x41 && code[4] == 0xC3)
+	{
+		fieldOffset = (int)(int8_t)code[3]; isGetter = true; detectedType = "void*";
+	}
+	// mov rax, [rcx + disp32] ; ret
+	else if (code[0] == 0x48 && code[1] == 0x8B && code[2] == 0x81 && code[7] == 0xC3)
+	{
+		fieldOffset = *(int32_t*)&code[3]; isGetter = true; detectedType = "void*";
+	}
+	// mov eax, [rcx] ; ret
+	else if (code[0] == 0x8B && code[1] == 0x01 && code[2] == 0xC3)
+	{
+		fieldOffset = 0; isGetter = true; detectedType = "int32_t";
+	}
+	// mov eax, [rcx + disp8] ; ret
+	else if (code[0] == 0x8B && code[1] == 0x41 && code[3] == 0xC3)
+	{
+		fieldOffset = (int)(int8_t)code[2]; isGetter = true; detectedType = "int32_t";
+	}
+	// mov eax, [rcx + disp32] ; ret
+	else if (code[0] == 0x8B && code[1] == 0x81 && code[6] == 0xC3)
+	{
+		fieldOffset = *(int32_t*)&code[2]; isGetter = true; detectedType = "int32_t";
+	}
+	// movss xmm0, [rcx + disp8] ; ret
+	else if (code[0] == 0xF3 && code[1] == 0x0F && code[2] == 0x10 && code[3] == 0x41 && code[5] == 0xC3)
+	{
+		fieldOffset = (int)(int8_t)code[4]; isGetter = true; detectedType = "float";
+	}
+	// movss xmm0, [rcx + disp32] ; ret
+	else if (code[0] == 0xF3 && code[1] == 0x0F && code[2] == 0x10 && code[3] == 0x81 && code[8] == 0xC3)
+	{
+		fieldOffset = *(int32_t*)&code[4]; isGetter = true; detectedType = "float";
+	}
+	// movzx eax, byte ptr [rcx + disp8] ; ret
+	else if (code[0] == 0x0F && code[1] == 0xB6 && code[2] == 0x41 && code[4] == 0xC3)
+	{
+		fieldOffset = (int)(int8_t)code[3]; isGetter = true; detectedType = "bool";
+	}
+	// movzx eax, byte ptr [rcx + disp32] ; ret
+	else if (code[0] == 0x0F && code[1] == 0xB6 && code[2] == 0x81 && code[7] == 0xC3)
+	{
+		fieldOffset = *(int32_t*)&code[3]; isGetter = true; detectedType = "bool";
+	}
+	// mov [rcx + disp8], rdx ; ret
+	else if (code[0] == 0x48 && code[1] == 0x89 && code[2] == 0x51 && code[4] == 0xC3)
+	{
+		fieldOffset = (int)(int8_t)code[3]; isSetter = true; detectedType = "void*";
+	}
+	// mov [rcx + disp32], rdx ; ret
+	else if (code[0] == 0x48 && code[1] == 0x89 && code[2] == 0x91 && code[7] == 0xC3)
+	{
+		fieldOffset = *(int32_t*)&code[3]; isSetter = true; detectedType = "void*";
+	}
+	// mov [rcx + disp8], edx ; ret
+	else if (code[0] == 0x89 && code[1] == 0x51 && code[3] == 0xC3)
+	{
+		fieldOffset = (int)(int8_t)code[2]; isSetter = true; detectedType = "int32_t";
+	}
+	// mov [rcx + disp32], edx ; ret
+	else if (code[0] == 0x89 && code[1] == 0x91 && code[6] == 0xC3)
+	{
+		fieldOffset = *(int32_t*)&code[2]; isSetter = true; detectedType = "int32_t";
+	}
+
+	if (fieldOffset >= 0)
+	{
+		FieldInfo* fi = c ? FindClassFieldByOffset(c, fieldOffset) : nullptr;
+		char offsetHex[16];
+		snprintf(offsetHex, sizeof(offsetHex), "0x%X", fieldOffset);
+
+		char rawNameBuf[128] = {0};
+		if (fi && SafeReadString((uintptr_t)fi->name, rawNameBuf, sizeof(rawNameBuf)) && rawNameBuf[0] != 0)
+		{
+			std::string rawName = rawNameBuf;
+			std::string safeName = SanitizeMemberName(rawName);
+
+			MemberTypeInfo* mti = (MemberTypeInfo*)SafeReadPointer((uintptr_t)&fi->typeInfo);
+			if (IsValidPointer(mti))
+			{
+				TypeInfo* fti = (TypeInfo*)SafeReadPointer((uintptr_t)&mti->typeInfo);
+				if (IsValidPointer(fti))
+				{
+					char typeNameBuf[128] = {0};
+					if (SafeReadString((uintptr_t)fti->name, typeNameBuf, sizeof(typeNameBuf)) && typeNameBuf[0] != 0)
+					{
+						const char* fn = GetFixedClassName(typeNameBuf);
+						unsigned short mFlags = SafeReadUInt16((uintptr_t)&mti->flags);
+						if (mFlags == kType_Pointer)
+							detectedType = std::string(fn) + "*";
+						else
+							detectedType = fn;
+					}
+				}
+			}
+
+			if (isGetter)
+			{
+				info.name = "Get_" + safeName;
+				info.returnType = detectedType;
+				info.comment = "getter for " + rawName + " (offset " + offsetHex + ")";
+				return info;
+			}
+			else if (isSetter)
+			{
+				info.name = "Set_" + safeName;
+				info.returnType = "void";
+				info.paramType = detectedType + " value";
+				info.comment = "setter for " + rawName + " (offset " + offsetHex + ")";
+				return info;
+			}
+		}
+		else
+		{
+			if (isGetter)
+			{
+				info.name = "Get_field_" + std::string(offsetHex);
+				info.returnType = detectedType;
+				info.comment = "getter for offset " + std::string(offsetHex);
+				return info;
+			}
+			else if (isSetter)
+			{
+				info.name = "Set_field_" + std::string(offsetHex);
+				info.returnType = "void";
+				info.paramType = detectedType + " value";
+				info.comment = "setter for offset " + std::string(offsetHex);
+				return info;
+			}
+		}
+	}
+
+	return info;
+}
 
 void ClassInfoManager::DumpVTable(ClassInfo* c, std::ofstream& file)
 {
@@ -1422,15 +1801,36 @@ void ClassInfoManager::DumpVTable(ClassInfo* c, std::ofstream& file)
 
 	for (int i = 0; i < vti.entryCount && i < (int)vti.entries.size(); i++)
 	{
-		file << "\t\tstatic constexpr uintptr_t Func_" << std::dec << i
+		std::string methodName = (i < (int)vti.methods.size() && !vti.methods[i].name.empty()) ? vti.methods[i].name : ("Func_" + std::to_string(i));
+		std::string comment = (i < (int)vti.methods.size()) ? vti.methods[i].comment : "";
+
+		file << "\t\tstatic constexpr uintptr_t " << methodName
 			<< " = 0x" << std::hex << vti.entries[i] << "; // Module+0x"
-			<< std::hex << vti.entries[i] << std::endl;
+			<< std::hex << vti.entries[i];
+		if (!comment.empty()) file << " (" << comment << ")";
+		file << std::endl;
 	}
 
 	file << std::endl;
 	file << "\t\tstatic void* GetEntry(void* instance, int index) {" << std::endl;
 	file << "\t\t\treturn (*(void***)instance)[index];" << std::endl;
 	file << "\t\t}" << std::endl;
+
+	// Emit typed callers for discovered getters
+	bool emittedCallers = false;
+	for (int i = 0; i < vti.entryCount && i < (int)vti.methods.size(); i++)
+	{
+		const auto& mi = vti.methods[i];
+		if (mi.name.rfind("Get_", 0) == 0 && !mi.returnType.empty() && mi.returnType != "void*")
+		{
+			if (!emittedCallers) { file << std::endl << "\t\t// --- Discovered Virtual Callers ---" << std::endl; emittedCallers = true; }
+			file << "\t\tstatic " << mi.returnType << " Call_" << mi.name << "(void* instance) {" << std::endl;
+			file << "\t\t\ttypedef " << mi.returnType << "(__fastcall* tFunc)(void*);" << std::endl;
+			file << "\t\t\treturn ((tFunc)GetEntry(instance, " << std::dec << i << "))(instance);" << std::endl;
+			file << "\t\t}" << std::endl;
+		}
+	}
+
 	file << "\t};" << std::endl;
 }
 
@@ -2085,8 +2485,10 @@ void ClassInfoManager::GenerateIDAScript()
 				uintptr_t vfuncRva = vtIt->second.entries[v];
 				if (vfuncRva > 0)
 				{
+					std::string methodName = (v < (int)vtIt->second.methods.size() && !vtIt->second.methods[v].name.empty()) ?
+						vtIt->second.methods[v].name : ("vfunc_" + std::to_string(v));
 					file << "    ida_name.set_name(idaapi.get_imagebase() + 0x" << std::hex << vfuncRva
-						<< ", '" << ti->name << "_vfunc_" << std::dec << v << "', ida_name.SN_NOCHECK)" << std::endl;
+						<< ", '" << ti->name << "__" << methodName << "', ida_name.SN_NOCHECK)" << std::endl;
 				}
 			}
 		}
@@ -2214,8 +2616,10 @@ void ClassInfoManager::GenerateGhidraScript()
 				uintptr_t vfuncRva = vtIt->second.entries[v];
 				if (vfuncRva > 0)
 				{
+					std::string methodName = (v < (int)vtIt->second.methods.size() && !vtIt->second.methods[v].name.empty()) ?
+						vtIt->second.methods[v].name : ("vfunc_" + std::to_string(v));
 					file << "addr = base_addr.add(0x" << std::hex << vfuncRva << ")" << std::endl;
-					file << "sym_table.createLabel(addr, '" << c->typeInfo->name << "_vfunc_" << std::dec << v << "', SourceType.USER_DEFINED)" << std::endl;
+					file << "sym_table.createLabel(addr, '" << c->typeInfo->name << "_" << methodName << "', SourceType.USER_DEFINED)" << std::endl;
 				}
 			}
 		}
@@ -2347,7 +2751,8 @@ void ClassInfoManager::GenerateSDKMasterHeader()
 
 	file << "#pragma once" << std::endl << std::endl;
 	file << "#include \"FBSDKTypes.h\"" << std::endl;
-	file << "#include \"FBClasses.h\"" << std::endl << std::endl;
+	file << "#include \"FBClasses.h\"" << std::endl;
+	file << "#include \"ConsoleVariables.h\"" << std::endl << std::endl;
 
 	std::vector<std::string> sorted(m_sdkFileNames.begin(), m_sdkFileNames.end());
 	std::sort(sorted.begin(), sorted.end());
@@ -2387,7 +2792,7 @@ void ClassInfoManager::ScanGlobalsForSingletons()
                     if (m_globalInstances.find(name) == m_globalInstances.end())
                     {
                         m_globalInstances[name] = ptr - m_moduleBase;
-                        Log("  Found global singleton: %s at Module+0x%llX", name.c_str(), ptr - m_moduleBase);
+                        Log("  Found global singleton (heap): %s at Module+0x%llX", name.c_str(), ptr - m_moduleBase);
                         found++;
                         
                         // Add to traversal map as a root!
@@ -2404,6 +2809,36 @@ void ClassInfoManager::ScanGlobalsForSingletons()
                             std::set<uintptr_t> visited;
                             visited.insert((uintptr_t)obj);
                             BuildTraversalMap((uintptr_t)obj, id, 1, chain, visited, ptr - m_moduleBase, name);
+                        }
+                    }
+                }
+            }
+            else if (obj && IsModulePointer(obj, m_moduleBase, m_moduleEnd))
+            {
+                // ptr itself might be an embedded static singleton in .data whose vtable is obj
+                ClassInfo* id = TryIdentifyClassByVTable(ptr, false);
+                if (id && id->typeInfo && id->typeInfo->name)
+                {
+                    std::string name = id->typeInfo->name;
+                    if (m_globalInstances.find(name) == m_globalInstances.end())
+                    {
+                        m_globalInstances[name] = ptr - m_moduleBase;
+                        Log("  Found static global singleton: %s at Module+0x%llX", name.c_str(), ptr - m_moduleBase);
+                        found++;
+                        
+                        if (m_traversalMap.find(name) == m_traversalMap.end())
+                        {
+                            TraversalChain rootChain;
+                            rootChain.targetClass = name;
+                            rootChain.resolvedAddress = ptr;
+                            rootChain.rootClassName = name;
+                            rootChain.rootGlobalOffset = ptr - m_moduleBase;
+                            m_traversalMap[name] = rootChain;
+                            
+                            std::vector<TraversalStep> chain;
+                            std::set<uintptr_t> visited;
+                            visited.insert(ptr);
+                            BuildTraversalMap(ptr, id, 1, chain, visited, ptr - m_moduleBase, name);
                         }
                     }
                 }
@@ -2540,3 +2975,505 @@ void ClassInfoManager::GenerateCheatEngineTable()
 
 	Log("Generated CheatEngineTable.CT");
 }
+
+void ClassInfoManager::DumpConsoleVariables()
+{
+	Log("=== Phase 6.1: Scanning and dumping Console Variables (CVars) ===");
+
+	m_cvarList.clear();
+	std::map<std::string, ConsoleVariableInfo> uniqueCVars;
+
+	// ------------------------------------------------------------------------
+	// Source 1: Frostbite Settings Singletons & Reflection
+	// In Frostbite, console variables are structured under Settings classes
+	// (e.g. UISettings -> UI.DrawEnable, WorldRenderSettings -> WorldRender.SkyEnable).
+	// With 160+ settings classes and 140+ live singletons, this provides thousands
+	// of verified, typed CVars with live runtime memory values.
+	// ------------------------------------------------------------------------
+	int settingsCVarCount = 0;
+	for (auto& pair : m_classMap)
+	{
+		std::string className = pair.first;
+		ClassInfo* c = pair.second;
+		if (!c || !c->typeInfo) continue;
+
+		// Filter for settings classes
+		if (className.find("Settings") == std::string::npos) continue;
+
+		// Extract CVar prefix: "UISettings" -> "UI", "WorldRenderSettings" -> "WorldRender"
+		std::string prefix = className;
+		if (prefix.length() > 8 && prefix.substr(prefix.length() - 8) == "Settings")
+		{
+			prefix = prefix.substr(0, prefix.length() - 8);
+		}
+		if (prefix.length() > 4 && prefix.substr(prefix.length() - 4) == "Base")
+		{
+			prefix = prefix.substr(0, prefix.length() - 4);
+		}
+		if (prefix.empty()) prefix = className;
+
+		// Check for live singleton instance
+		uintptr_t instanceAddr = 0;
+		uintptr_t globalOffset = 0;
+		bool isHeap = false;
+
+		auto git = m_globalInstances.find(className);
+		if (git != m_globalInstances.end())
+		{
+			globalOffset = git->second;
+			uintptr_t gAddr = m_moduleBase + globalOffset;
+			void* ptrVal = SafeReadPointer(gAddr);
+			if (ptrVal && !IsModulePointer(ptrVal, m_moduleBase, m_moduleEnd))
+			{
+				instanceAddr = (uintptr_t)ptrVal;
+				isHeap = true;
+			}
+			else
+			{
+				instanceAddr = gAddr;
+				isHeap = false;
+			}
+		}
+		else
+		{
+			auto tit = m_traversalMap.find(className);
+			if (tit != m_traversalMap.end())
+			{
+				instanceAddr = tit->second.resolvedAddress;
+			}
+		}
+
+		// Gather members (including inheritance)
+		std::vector<ClassInfo*> parents = GetParents(c);
+		std::vector<FieldInfo*> allMembers;
+		for (ClassInfo* p : parents)
+		{
+			if (p && p->typeInfo)
+				ParseClassMembers(p->typeInfo, allMembers);
+		}
+		ParseClassMembers(c->typeInfo, allMembers);
+
+		for (FieldInfo* field : allMembers)
+		{
+			if (!IsValidPointer(field)) continue;
+
+			unsigned short fieldOffset = SafeReadUInt16((uintptr_t)&field->offset);
+			char nameBuf[128] = {0};
+			if (!IsValidPointer((void*)field->name) || !SafeReadString((uintptr_t)field->name, nameBuf, sizeof(nameBuf)) || !nameBuf[0])
+				continue;
+
+			std::string fieldName = nameBuf;
+			// Strip 'm_' prefix if present
+			std::string cvarField = fieldName;
+			if (cvarField.rfind("m_", 0) == 0 && cvarField.length() > 2)
+				cvarField = cvarField.substr(2);
+			else if (cvarField.rfind("m", 0) == 0 && cvarField.length() > 1 && isupper((unsigned char)cvarField[1]))
+				cvarField = cvarField.substr(1);
+
+			std::string cvarName = prefix + "." + cvarField;
+
+			// Determine C++ type string
+			std::string typeStr = "uint32_t";
+			if (IsValidPointer(field->typeInfo) && IsValidPointer(field->typeInfo->typeInfo))
+			{
+				char typeBuf[128] = {0};
+				if (IsValidPointer((void*)field->typeInfo->typeInfo->name) &&
+					SafeReadString((uintptr_t)field->typeInfo->typeInfo->name, typeBuf, sizeof(typeBuf)))
+				{
+					std::string rawType = typeBuf;
+					if (rawType == "Boolean") typeStr = "bool";
+					else if (rawType == "Float32") typeStr = "float";
+					else if (rawType == "Float64") typeStr = "double";
+					else if (rawType == "Int32") typeStr = "int32_t";
+					else if (rawType == "Uint32") typeStr = "uint32_t";
+					else if (rawType == "Int16") typeStr = "int16_t";
+					else if (rawType == "Uint16") typeStr = "uint16_t";
+					else if (rawType == "Int8") typeStr = "int8_t";
+					else if (rawType == "Uint8") typeStr = "uint8_t";
+					else if (rawType == "CString") typeStr = "const char*";
+					else if (rawType == "String") typeStr = "fb::String";
+					else typeStr = rawType;
+				}
+			}
+
+			// Read live value if instance is available
+			std::string liveVal = "";
+			if (instanceAddr && IsValidPointer((void*)instanceAddr))
+			{
+				uintptr_t fieldAddr = instanceAddr + fieldOffset;
+				if (typeStr == "bool")
+				{
+					uint8_t bv = 0;
+					if (SafeReadBytes(fieldAddr, &bv, 1))
+						liveVal = (bv != 0) ? "true" : "false";
+				}
+				else if (typeStr == "float")
+				{
+					float fv = 0.0f;
+					if (SafeReadBytes(fieldAddr, &fv, 4))
+					{
+						char fBuf[32];
+						sprintf_s(fBuf, "%g", fv);
+						liveVal = fBuf;
+					}
+				}
+				else if (typeStr == "double")
+				{
+					double dv = 0.0;
+					if (SafeReadBytes(fieldAddr, &dv, 8))
+					{
+						char dBuf[32];
+						sprintf_s(dBuf, "%g", dv);
+						liveVal = dBuf;
+					}
+				}
+				else if (typeStr == "int32_t")
+				{
+					int32_t iv = 0;
+					if (SafeReadBytes(fieldAddr, &iv, 4))
+						liveVal = std::to_string(iv);
+				}
+				else if (typeStr == "uint32_t")
+				{
+					uint32_t uv = 0;
+					if (SafeReadBytes(fieldAddr, &uv, 4))
+						liveVal = std::to_string(uv);
+				}
+				else if (typeStr == "int16_t")
+				{
+					int16_t iv = 0;
+					if (SafeReadBytes(fieldAddr, &iv, 2))
+						liveVal = std::to_string(iv);
+				}
+				else if (typeStr == "uint16_t")
+				{
+					uint16_t uv = 0;
+					if (SafeReadBytes(fieldAddr, &uv, 2))
+						liveVal = std::to_string(uv);
+				}
+				else if (typeStr == "int8_t")
+				{
+					int8_t iv = 0;
+					if (SafeReadBytes(fieldAddr, &iv, 1))
+						liveVal = std::to_string((int)iv);
+				}
+				else if (typeStr == "uint8_t")
+				{
+					uint8_t uv = 0;
+					if (SafeReadBytes(fieldAddr, &uv, 1))
+						liveVal = std::to_string((unsigned int)uv);
+				}
+				else if (typeStr == "const char*")
+				{
+					void* strP = SafeReadPointer(fieldAddr);
+					if (strP && IsValidPointer(strP))
+					{
+						char sBuf[128] = {0};
+						if (SafeReadString((uintptr_t)strP, sBuf, sizeof(sBuf)))
+							liveVal = sBuf;
+					}
+				}
+			}
+
+			ConsoleVariableInfo cvi;
+			cvi.name = cvarName;
+			cvi.description = "Member of " + className + " (" + fieldName + ")";
+			cvi.settingsClass = className;
+			cvi.memberOffset = fieldOffset;
+			cvi.globalOffset = globalOffset;
+			cvi.isHeap = isHeap;
+			cvi.typeStr = typeStr;
+			cvi.liveValue = liveVal;
+			cvi.rva = (!isHeap && globalOffset > 0) ? (globalOffset + fieldOffset) : 0;
+
+			uniqueCVars[cvarName] = cvi;
+			settingsCVarCount++;
+		}
+	}
+	Log("Extracted %d Console Variables from Settings reflection (%d unique)", settingsCVarCount, (int)uniqueCVars.size());
+
+	// ------------------------------------------------------------------------
+	// Source 2: Dynamic Engine Command & CVar Linked-List Nodes Scan
+	// Scan memory sections for registered commands and anchor nodes.
+	// ------------------------------------------------------------------------
+	PIMAGE_DOS_HEADER dosH = (PIMAGE_DOS_HEADER)m_moduleBase;
+	PIMAGE_NT_HEADERS ntH = (PIMAGE_NT_HEADERS)(m_moduleBase + dosH->e_lfanew);
+	PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(ntH);
+
+	std::vector<std::pair<uintptr_t, uintptr_t>> dataSections;
+	std::vector<std::pair<uintptr_t, uintptr_t>> readableSections;
+
+	for (WORD i = 0; i < ntH->FileHeader.NumberOfSections; i++, sec++)
+	{
+		uintptr_t start = m_moduleBase + sec->VirtualAddress;
+		uintptr_t end = start + sec->Misc.VirtualSize;
+		if (end <= start) continue;
+
+		bool isData = (sec->Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) ||
+		              (sec->Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA);
+
+		if (isData)
+			dataSections.push_back({start, end});
+
+		if (sec->Characteristics & IMAGE_SCN_MEM_READ)
+			readableSections.push_back({start, end});
+	}
+
+	// Verified Frostbite anchor strings for commands/cvars
+	const char* anchors[] = {
+		"UI.DrawEnable",
+		"WorldRender.SkyEnable",
+		"DebugCam.ToggleToFreeCamera",
+		"demo.pausePlayback",
+		"demo.playPlayback",
+		"demo.rewindPlayback",
+		"demo.showFrameNumber",
+		"Debug.DrawScreenCenterHelper",
+		"EmitterSystem.QuadEnableRendering",
+		"EmitterSystem.MeshRenderingEnable",
+		nullptr
+	};
+
+	std::set<uintptr_t> visitedNodes;
+	auto extractNode = [&](uintptr_t node, int nameOff, int descOff, int dataOff, int nextOff, int prevOff) {
+		std::vector<uintptr_t> queue;
+		queue.push_back(node);
+
+		while (!queue.empty() && visitedNodes.size() < 4000)
+		{
+			uintptr_t curr = queue.back();
+			queue.pop_back();
+
+			if (!curr || visitedNodes.count(curr)) continue;
+			visitedNodes.insert(curr);
+
+			// Read name
+			void* namePtr = SafeReadPointer(curr + nameOff);
+			if (!namePtr || !IsValidPointer(namePtr)) continue;
+			char nameBuf[128] = {0};
+			if (!SafeReadString((uintptr_t)namePtr, nameBuf, sizeof(nameBuf)) || strlen(nameBuf) < 2) continue;
+
+			// Filter out non-printable names
+			bool hasAlpha = false;
+			for (int c = 0; nameBuf[c]; c++) {
+				if (isalpha((unsigned char)nameBuf[c])) { hasAlpha = true; break; }
+			}
+			if (!hasAlpha) continue;
+
+			// Read description
+			char descBuf[256] = {0};
+			if (descOff >= 0)
+			{
+				void* descPtr = SafeReadPointer(curr + descOff);
+				if (descPtr && IsValidPointer(descPtr))
+				{
+					SafeReadString((uintptr_t)descPtr, descBuf, sizeof(descBuf));
+				}
+			}
+
+			// Read data pointer
+			void* dataPtr = (dataOff >= 0) ? SafeReadPointer(curr + dataOff) : nullptr;
+			uintptr_t dataAddr = (uintptr_t)dataPtr;
+
+			ConsoleVariableInfo cvi;
+			cvi.name = nameBuf;
+			cvi.description = descBuf;
+			cvi.rva = (dataAddr >= m_moduleBase && dataAddr < m_moduleEnd) ? (dataAddr - m_moduleBase) : 0;
+			cvi.typeStr = (dataAddr != 0) ? "bool" : "command";
+			cvi.liveValue = "";
+
+			if (dataAddr && IsValidPointer((void*)dataAddr))
+			{
+				uint8_t bVal = 0;
+				if (SafeReadBytes(dataAddr, &bVal, 1))
+				{
+					cvi.liveValue = (bVal != 0) ? "1" : "0";
+					cvi.typeStr = (bVal <= 1) ? "bool" : "int32_t";
+				}
+			}
+
+			// If not already discovered via settings reflection or has more info, add it
+			if (uniqueCVars.find(cvi.name) == uniqueCVars.end())
+			{
+				uniqueCVars[cvi.name] = cvi;
+			}
+
+			// Enqueue next
+			if (nextOff >= 0)
+			{
+				void* nextPtr = SafeReadPointer(curr + nextOff);
+				if (nextPtr && IsValidPointer(nextPtr) && !visitedNodes.count((uintptr_t)nextPtr))
+					queue.push_back((uintptr_t)nextPtr);
+			}
+
+			// Enqueue prev
+			if (prevOff >= 0)
+			{
+				void* prevPtr = SafeReadPointer(curr + prevOff);
+				if (prevPtr && IsValidPointer(prevPtr) && !visitedNodes.count((uintptr_t)prevPtr))
+					queue.push_back((uintptr_t)prevPtr);
+			}
+		}
+	};
+
+	// Try each anchor string in readable sections
+	for (int a = 0; anchors[a]; a++)
+	{
+		const char* target = anchors[a];
+		size_t targetLen = strlen(target) + 1;
+
+		uintptr_t strAddr = 0;
+		for (auto& secPair : readableSections)
+		{
+			uintptr_t sStart = secPair.first;
+			uintptr_t sEnd = secPair.second;
+			if (sEnd <= sStart + targetLen) continue;
+
+			for (uintptr_t p = sStart; p <= sEnd - targetLen; p++)
+			{
+				char testChar = 0;
+				if (!SafeReadBytes(p, &testChar, 1) || testChar != target[0]) continue;
+
+				char testBuf[128] = {0};
+				if (SafeReadString(p, testBuf, sizeof(testBuf)) && strcmp(testBuf, target) == 0)
+				{
+					strAddr = p;
+					break;
+				}
+			}
+			if (strAddr) break;
+		}
+
+		if (!strAddr) continue;
+
+		// Scan data sections for pointers to this anchor string
+		for (auto& secPair : dataSections)
+		{
+			uintptr_t dStart = secPair.first;
+			uintptr_t dEnd = secPair.second;
+
+			for (uintptr_t p = dStart; p <= dEnd - 8; p += 8)
+			{
+				uintptr_t val = (uintptr_t)SafeReadPointer(p);
+				if (val == strAddr)
+				{
+					// Layout 1: next @ 0x00, prev @ 0x08, name @ 0x10, desc @ 0x18, data @ 0x20
+					if (p >= dStart + 0x10)
+						extractNode(p - 0x10, 0x10, 0x18, 0x20, 0x00, 0x08);
+
+					// Layout 2: next @ 0x00, name @ 0x08, desc @ 0x10, data @ 0x18
+					if (p >= dStart + 0x08)
+						extractNode(p - 0x08, 0x08, 0x10, 0x18, 0x00, -1);
+
+					// Layout 3: name @ 0x00, next @ 0x08, desc @ 0x10, data @ 0x18
+					extractNode(p, 0x00, 0x10, 0x18, 0x08, -1);
+				}
+			}
+		}
+	}
+
+	for (auto& pair : uniqueCVars)
+	{
+		m_cvarList.push_back(pair.second);
+	}
+
+	Log("Total Discovered Console Variables / Commands: %d", (int)m_cvarList.size());
+
+	// ------------------------------------------------------------------------
+	// Output 1: Generate SDK/ConsoleVariables.h
+	// ------------------------------------------------------------------------
+	char headerPath[MAX_PATH];
+	GetDirFile("SDK\\ConsoleVariables.h", headerPath, sizeof(headerPath));
+	std::ofstream hFile(headerPath, std::ios::out | std::ios::trunc);
+	if (hFile.is_open())
+	{
+		hFile << "// FrostbiteGen SDK - Discovered Engine Console Variables (CVars)\n";
+		hFile << "#pragma once\n";
+		hFile << "#include <cstdint>\n";
+		hFile << "#include \"FBSDKTypes.h\"\n\n";
+		hFile << "namespace fb {\n";
+		hFile << "namespace CVars {\n\n";
+
+		for (auto& cvar : m_cvarList)
+		{
+			std::string sanitized = cvar.name;
+			for (char& ch : sanitized)
+			{
+				if (!isalnum((unsigned char)ch)) ch = '_';
+			}
+			if (isdigit((unsigned char)sanitized[0])) sanitized = "_" + sanitized;
+
+			hFile << "\t// " << cvar.name;
+			if (!cvar.description.empty())
+				hFile << " - " << cvar.description;
+			if (!cvar.liveValue.empty())
+				hFile << " [Live Value: " << cvar.liveValue << "]";
+			hFile << "\n";
+
+			if (cvar.globalOffset > 0)
+			{
+				if (cvar.isHeap)
+				{
+					hFile << "\tinline " << cvar.typeStr << "* GetPtr_" << sanitized << "() {\n";
+					hFile << "\t\tuintptr_t inst = *(uintptr_t*)(fb::GetModuleBase() + 0x" << std::hex << cvar.globalOffset << ");\n";
+					hFile << "\t\tif (!inst) return nullptr;\n";
+					hFile << "\t\treturn (" << cvar.typeStr << "*)(inst + 0x" << std::hex << cvar.memberOffset << ");\n";
+					hFile << "\t}\n\n";
+				}
+				else
+				{
+					hFile << "\tinline " << cvar.typeStr << "* GetPtr_" << sanitized << "() {\n";
+					hFile << "\t\treturn (" << cvar.typeStr << "*)(fb::GetModuleBase() + 0x" << std::hex << (cvar.globalOffset + cvar.memberOffset) << ");\n";
+					hFile << "\t}\n\n";
+				}
+			}
+			else if (cvar.rva > 0)
+			{
+				hFile << "\tstatic constexpr uintptr_t " << sanitized << "_RVA = 0x" << std::hex << cvar.rva << ";\n";
+				hFile << "\tinline " << cvar.typeStr << "* GetPtr_" << sanitized << "() {\n";
+				hFile << "\t\treturn (" << cvar.typeStr << "*)(fb::GetModuleBase() + " << sanitized << "_RVA);\n";
+				hFile << "\t}\n\n";
+			}
+			else
+			{
+				hFile << "\t// (no static global pointer found)\n\n";
+			}
+		}
+
+		hFile << "} // namespace CVars\n";
+		hFile << "} // namespace fb\n";
+		hFile.close();
+		Log("Generated ConsoleVariables.h");
+	}
+
+	// ------------------------------------------------------------------------
+	// Output 2: Generate SDK/CVars.json
+	// ------------------------------------------------------------------------
+	char jsonPath[MAX_PATH];
+	GetDirFile("SDK\\CVars.json", jsonPath, sizeof(jsonPath));
+	std::ofstream jFile(jsonPath, std::ios::out | std::ios::trunc);
+	if (jFile.is_open())
+	{
+		jFile << "{\n";
+		bool first = true;
+		for (auto& cvar : m_cvarList)
+		{
+			if (!first) jFile << ",\n";
+			jFile << "  \"" << EscapeJson(cvar.name) << "\": {\n";
+			jFile << "    \"description\": \"" << EscapeJson(cvar.description) << "\",\n";
+			jFile << "    \"type\": \"" << EscapeJson(cvar.typeStr) << "\",\n";
+			jFile << "    \"liveValue\": \"" << EscapeJson(cvar.liveValue) << "\",\n";
+			jFile << "    \"settingsClass\": \"" << EscapeJson(cvar.settingsClass) << "\",\n";
+			jFile << "    \"memberOffset\": \"0x" << std::hex << cvar.memberOffset << "\",\n";
+			jFile << "    \"globalOffset\": \"0x" << std::hex << cvar.globalOffset << "\",\n";
+			jFile << "    \"isHeap\": " << (cvar.isHeap ? "true" : "false") << ",\n";
+			jFile << "    \"rva\": \"0x" << std::hex << cvar.rva << "\"\n";
+			jFile << "  }";
+			first = false;
+		}
+		jFile << "\n}\n";
+		jFile.close();
+		Log("Generated CVars.json");
+	}
+}
+

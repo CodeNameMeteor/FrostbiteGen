@@ -26,11 +26,37 @@ struct TraversalChain
 	uintptr_t resolvedAddress;           // live instance address (at generation time)
 };
 
+/// Discovered virtual method metadata
+struct VTableMethodInfo
+{
+	int index;
+	uintptr_t rva;
+	std::string name;        // e.g. "GetType", "Get_m_health", "Set_m_health", "Stub_Return0"
+	std::string returnType;  // e.g. "TypeInfo*", "float", "void", "bool"
+	std::string paramType;   // e.g. "", "float value", "bool value"
+	std::string comment;     // e.g. "field offset 0x140", "empty stub"
+};
+
 /// VTable information captured from a live instance.
 struct VTableInfo
 {
 	int entryCount;
-	std::vector<uintptr_t> entries;      // module-relative addresses of each entry
+	std::vector<uintptr_t> entries;          // module-relative addresses of each entry
+	std::vector<VTableMethodInfo> methods;   // analyzed method signatures
+};
+
+/// Discovered engine console variable / command
+struct ConsoleVariableInfo
+{
+	std::string name;
+	std::string description;
+	uintptr_t rva = 0;              // Module RVA of the value pointer / node (if static)
+	std::string typeStr;            // "bool", "int", "float", "command", etc.
+	std::string liveValue;          // e.g. "1", "60.0", "true"
+	std::string settingsClass;      // e.g. "UISettings"
+	uintptr_t globalOffset = 0;     // RVA of singleton pointer in module
+	uintptr_t memberOffset = 0;     // offset inside instance
+	bool isHeap = false;            // true if accessed via *(fb::GetModuleBase() + globalOffset)
 };
 
 // ============================================================================
@@ -150,6 +176,10 @@ private:
 	
 	// --- P4: Additional Bonus Outputs ---
 	void GenerateCheatEngineTable();
+	void DumpConsoleVariables();
+
+	// --- Micro-Disassembly Function Analysis ---
+	VTableMethodInfo AnalyzeVTableMethod(ClassInfo* c, int index, uintptr_t funcAddr);
 
 private:
 	ClassInfo* m_listHead;
@@ -174,6 +204,9 @@ private:
 
 	/// VTable map: class name â†’ captured vtable info.
 	std::map<std::string, VTableInfo> m_vtableMap;
+
+	/// Discovered console variables and commands.
+	std::vector<ConsoleVariableInfo> m_cvarList;
 
 	/// Cross-reference map: class name â†’ list of (referencing class, field name).
 	std::map<std::string, std::vector<std::pair<std::string, std::string>>> m_crossRefMap;

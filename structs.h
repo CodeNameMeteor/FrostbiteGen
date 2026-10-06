@@ -5,6 +5,10 @@ class FieldInfo;
 
 DWORD_PTR FindPattern(DWORD_PTR dwAddress, DWORD_PTR dwLen, DWORD_PTR offset, bool deref, BYTE *bMask, char * szMask);
 
+/// SEH filter that only handles access violations. Anything else (stack overflow,
+/// C++ exceptions, guard pages) keeps propagating instead of being silently swallowed.
+#define FBGEN_AV_FILTER (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+
 /// Safely copy N bytes from an address. Returns false on fault.
 inline bool SafeReadBytes(uintptr_t addr, void* dst, size_t count)
 {
@@ -14,6 +18,81 @@ inline bool SafeReadBytes(uintptr_t addr, void* dst, size_t count)
 		return true;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+/// True if the page protection allows reads (and is not a guard / no-access page).
+inline bool IsReadableProtect(DWORD protect)
+{
+	if (protect & (PAGE_GUARD | PAGE_NOACCESS))
+		return false;
+	return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+		PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+/// Splits [start, end) into runs of committed, readable memory (adjacent readable
+/// regions are merged), so scanners never touch unmapped, guard or no-access pages.
+inline std::vector<std::pair<uintptr_t, uintptr_t>> GetReadableRuns(uintptr_t start, uintptr_t end)
+{
+	std::vector<std::pair<uintptr_t, uintptr_t>> runs;
+	uintptr_t addr = start;
+	while (addr < end)
+	{
+		MEMORY_BASIC_INFORMATION mbi;
+		if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi)))
+			break;
+		uintptr_t regionStart = (uintptr_t)mbi.BaseAddress;
+		uintptr_t regionEnd = regionStart + mbi.RegionSize;
+		if (regionEnd <= addr)
+			break;
+		uintptr_t s = addr > regionStart ? addr : regionStart;
+		uintptr_t e = end < regionEnd ? end : regionEnd;
+		if (mbi.State == MEM_COMMIT && IsReadableProtect(mbi.Protect))
+		{
+			if (!runs.empty() && runs.back().second == s)
+				runs.back().second = e;
+			else
+				runs.push_back({ s, e });
+		}
+		addr = regionEnd;
+	}
+	return runs;
+}
+
+/// Finds the first occurrence of `needle` in [start, end). Returns 0 if absent or on fault.
+inline uintptr_t SafeFindBytes(uintptr_t start, uintptr_t end, const void* needle, size_t len)
+{
+	if (len == 0 || end <= start || end - start < len)
+		return 0;
+	__try
+	{
+		const unsigned char first = *(const unsigned char*)needle;
+		const unsigned char* p = (const unsigned char*)start;
+		const unsigned char* last = (const unsigned char*)(end - len);
+		while (p <= last)
+		{
+			p = (const unsigned char*)memchr(p, first, (size_t)(last - p) + 1);
+			if (!p)
+				return 0;
+			if (memcmp(p, needle, len) == 0)
+				return (uintptr_t)p;
+			++p;
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {}
+	return 0;
+}
+
+/// True if `s` is a plain C/C++ identifier ([A-Za-z_][A-Za-z0-9_]*).
+inline bool IsIdentifierChars(const std::string& s)
+{
+	if (s.empty() || !(isalpha((unsigned char)s[0]) || s[0] == '_'))
+		return false;
+	for (char c : s)
+	{
+		if (!isalnum((unsigned char)c) && c != '_')
+			return false;
+	}
+	return true;
 }
 
 // ============================================================================
@@ -127,7 +206,6 @@ inline bool IsModulePointer(void* ptr, uintptr_t modBase, uintptr_t modEnd)
 }
 
 /// Safely count vtable entries starting from an object's vtable pointer.
-/// Safely count vtable entries starting from an object's vtable pointer.
 /// Walks forward until a non-module pointer or unmapped page is hit (max 256 entries).
 inline int SafeCountVTableEntries(void* instance, uintptr_t modBase, uintptr_t modEnd)
 {
@@ -187,15 +265,17 @@ public:
 			uintptr_t modBase;
 			size_t modSize;
 			GetGameModuleInfo(modBase, modSize);
-			DWORD_PTR dwMatch = FindPattern((DWORD_PTR)modBase, (DWORD_PTR)modSize, 0, false, (BYTE*)"\x48\x8B\x05\x00\x00\x00\x00\x48\x89\x41\x08\x48\x89\x0D\x00\x00\x00\x00\xC3", "xxx????xxxxxxx????x");
+			DWORD_PTR dwMatch = FindPattern((DWORD_PTR)modBase, (DWORD_PTR)modSize, 0, false, (BYTE*)"\x48\x8B\x05\x00\x00\x00\x00\x48\x89\x41\x08\x48\x89\x0D\x00\x00\x00\x00\xC3", (char*)"xxx????xxxxxxx????x");
 			if (!dwMatch)
 				return NULL;
 
-			int32_t dwOffset = *(int32_t*)(dwMatch + 3);
+			int32_t dwOffset = 0;
+			if (!SafeReadBytes(dwMatch + 3, &dwOffset, sizeof(dwOffset)))
+				return NULL;
 			DWORD_PTR dwOffset2 = (dwMatch + 7);
 
 			instance = (ClassInfo**)(dwOffset2 + (int64_t)dwOffset);
-			Log("Instance found at 0x%016llX", instance);
+			Log("Instance found at 0x%016llX", (unsigned long long)(uintptr_t)instance);
 		}
 		if (!IsValidPointer(instance))
 			return NULL;

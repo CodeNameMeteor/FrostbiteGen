@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  sdk-generation-test:
+    name: SDK generation test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate an SDK from the fake engine, compile it and run checks
+        run: tests/run_sdk_test.sh build/sdk-test
+      - name: Upload generated SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-sdk
+          path: build/sdk-test/out/SDK
+
+  windows-build:
+    name: MSVC build (Windows)
+    runs-on: windows-latest
+    needs: sdk-generation-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -A x64
+      - name: Build FrostbiteGen.dll
+        run: cmake --build build --config Release
+      - name: Download generated SDK
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-sdk
+          path: generated-sdk
+      - name: Compile the generated SDK with MSVC (layout static_asserts enabled)
+        run: |
+          cmake -S tests/msvc_sdk_check -B build/msvc-sdk-check -A x64 -DSDK_DIR="${{ github.workspace }}/generated-sdk"
+          cmake --build build/msvc-sdk-check --config Release

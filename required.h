@@ -15,11 +15,18 @@
 #include <algorithm>
 #include <ctime>
 #include <cstdint>
+#include <cstring>
+#include <cstdarg>
+#include <cmath>
+#include <limits>
 #include <sstream>
 #include <set>
 #include <cctype>
 
+extern char g_szBaseDir[MAX_PATH];
+
 void Log(const char* szText, ...);
+void CloseLog();
 void GetDirFile(const char* file, char* out, size_t len);
 
 #endif

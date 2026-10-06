@@ -19,6 +19,7 @@ A C++ SDK generator for Frostbite 3 engine games (Mirror's Edge Catalyst). Injec
    - [Using Offset Constants](#example-6-using-offset-constants-for-manual-access)
 6. [SDK Architecture](#sdk-architecture)
 7. [Troubleshooting](#troubleshooting)
+8. [Running the Tests](#running-the-tests)
 
 ---
 
@@ -49,6 +50,8 @@ The output DLL is at `build/Release/FrostbiteGen.dll`.
 
 ## Generating the SDK
 
+> **Warning: offline / single-player use only.** FrostbiteGen also recognises Battlefield 4, Battlefield 1 and Star Wars Battlefront II, which are online games with anti-cheat. Injecting any DLL into them can get your account banned. Use it at your own risk.
+
 ### Step 1: Launch Mirror's Edge Catalyst
 
 Start the game and wait until you reach the main menu (or are in-game). The type system must be fully initialized before injection.
@@ -57,27 +60,34 @@ Start the game and wait until you reach the main menu (or are in-game). The type
 
 Use any DLL injector to load `FrostbiteGen.dll` into the game process:
 
-- [Process Hacker](https://processhacker.sourceforge.io/)
+- [System Informer](https://systeminformer.sourceforge.io/) (formerly Process Hacker)
 - [Xenos Injector](https://github.com/DarthTon/Xenos)
 - Or any x64-compatible injector
 
-```
+```text
 Target Process: MirrorsEdgeCatalyst.exe
 DLL Path:       <your_path>\build\Release\FrostbiteGen.dll
 ```
 
 ### Step 3: Wait for Generation
 
-A message box will appear when generation is complete:
-
-> **SDK generated successfully!**
-> Check the SDK\ folder for output.
+A message box appears in front of the game when generation finishes, with a sound. It shows how many files were written, whether anything failed, and where the output and the log are. If anything failed, the title reads **SDK generated with errors** and `fbgen.txt` lists each problem.
 
 ### Step 4: Collect the Output
 
-The generated SDK is written next to the DLL:
+The generated SDK is written to an `SDK` folder next to the DLL, and the log to `fbgen.txt` beside it. The folder contains:
 
-```
+- `FBSDKTypes.h`: runtime utilities in namespace `fb` (always include this)
+- `FBClasses.h`: forward declarations of every generated type
+- `SDK.h`: master include (includes everything)
+- One header per class, struct and enum, for example `GameSettings.h` or `ClientGameContext.h`
+- `ConsoleVariables.h` and `CVars.json`: console variables discovered from `*Settings` classes
+- `sdk.json` (all types as JSON) and `LiveDump.json` (live singleton addresses)
+- `ida_import.py` and `ghidra_import.py`: import types and labels into IDA Pro or Ghidra
+- `CheatEngineTable.CT`: Cheat Engine structure definitions
+- `ClassHierarchy.h` and `CrossReferences.h`: reference comments
+
+```text
 build/Release/
 ├── FrostbiteGen.dll
 ├── fbgen.txt              ← generation log
@@ -87,19 +97,19 @@ build/Release/
     ├── SDK.h               ← master include (includes everything)
     ├── GameSettings.h      ← example: game settings class
     ├── ClientGameContext.h
-    ├── PlayerData.h
     ├── ...                 ← hundreds of generated headers
-    └── Array.h             ← (if referenced by any class)
+    └── ida_import.py, ghidra_import.py, sdk.json, CheatEngineTable.CT, ...
 ```
 
-Check `fbgen.txt` for the discovered instance offset:
+`fbgen.txt` shows how the root object and singletons were found:
 
-```
+```text
 [14:25:28] FrostbiteGen SDK Generator starting...
 [14:25:28] Module base: 0x0000000140000000
 [14:25:28] ClassInfo head: 0x00000001428109E0
-[14:25:28] Discovered instance offset in ClassInfo: 0x48 (127/1893 DataContainers)
-[14:25:30] SDK generation complete!
+[14:25:28]   Root context class (verified by vtable): ClientGameContext
+[14:25:29]   Found global singleton (heap): GameSettings at Module+0x2401D10
+[14:25:30] SDK generation complete: 1903 files written, 0 files failed, 0 types skipped after a fault
 ```
 
 ---
@@ -113,24 +123,26 @@ Every generated class header includes these features:
 ```cpp
 static void* GetTypeInfo()
 {
-    // Module-relative address — works across game restarts
+    // Module-relative address of the type's ClassInfo record - works across game restarts
     return (void*)(fb::GetModuleBase() + 0x28109E0);
 }
 ```
 
-### 2. Automatic Instance Resolution (DataContainer classes)
+### 2. Automatic Instance Resolution
+
+For every class that was reachable while the SDK was generated, `GetInstance()` replays how it was found, either from a global singleton or by following pointers from the root context:
 
 ```cpp
 static GameSettings* GetInstance()
 {
-    __try {
-        uintptr_t classInfo = fb::GetModuleBase() + 0x28109E0;
-        void* instance = *(void**)(classInfo + 0x48);
-        if (!fb::IsValidPtr(instance)) return nullptr;
-        return static_cast<GameSettings*>(instance);
-    } __except(1) { return nullptr; }
+    // Global singleton found dynamically
+    uintptr_t ctx = fb::Read<uintptr_t>(fb::GetModuleBase() + 0x2401D10); // global GameSettings
+    if (!ctx) return nullptr;
+    return reinterpret_cast<GameSettings*>(ctx);
 }
 ```
+
+Classes that were not reachable get a `GetInstance()` that returns `nullptr`, with a comment explaining why.
 
 ### 3. Named Offset Constants
 
@@ -150,9 +162,17 @@ bool GetIsGodMode() const { return m_IsGodMode; }
 void SetIsGodMode(bool value) { m_IsGodMode = value; }
 ```
 
-### 5. Correct Memory Layout
+Engine integer types map to fixed-width types (`Int64` → `int64_t`, `Uint8` → `uint8_t`, …). Members whose type is not in the SDK are declared as raw bytes (`unsigned char m_X[size]`) so the layout stays correct. A field named `Instance` or `TypeInfo` gets `GetInstanceField()` / `GetTypeInfoField()` so it doesn't clash with the static functions.
 
-The class member declarations are laid out to match the exact in-memory structure, including padding bytes. This means you can cast a raw pointer to the class type and access members directly.
+### 5. Memory Layout Matching the Engine
+
+Members are laid out at the offsets the engine reports, with explicit padding, so you can cast a raw pointer to the class type and access members directly. Each header also contains `static_assert`s that check every member offset and the class size against the engine's values. Turn them on by defining `FBGEN_VERIFY_LAYOUT` in your project; any mismatch then fails the build instead of corrupting game memory.
+
+### 6. Snapshots, VTables and Hook Helpers
+
+- `Defaults`: values read from the live instance **at generation time** (not engine defaults).
+- `VTable`: module-relative addresses of virtual functions, with names for recognised getters and setters.
+- `HookVFunc_InPlace` / `HookVFunc_Shadow`: thin wrappers around `fb::HookVFunc_InPlace` / `fb::HookVFunc_Shadow` that pass this class's vtable size.
 
 ---
 
@@ -189,7 +209,7 @@ target_include_directories(MyMECMod PRIVATE ${CMAKE_SOURCE_DIR}/SDK)
 
 if(MSVC)
     target_compile_definitions(MyMECMod PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
-    target_compile_options(MyMECMod PRIVATE /EHa)  # Required for __try/__except in SDK
+    target_compile_options(MyMECMod PRIVATE /EHa)  # run destructors when the SDK's __try/__except catches a fault
 endif()
 ```
 
@@ -318,9 +338,10 @@ Use `fb::ReadChain` to follow multi-level pointer paths:
 
 void ReadPlayerHealth()
 {
-    // Example: follow a pointer chain from a known base
+    // Example: follow a pointer chain from a known global pointer
     // Base -> +0x28 (PlayerManager) -> +0x10 (LocalPlayer) -> +0x20 (Health)
-    uintptr_t base = fb::GetModuleBase() + 0x1234567;  // your known offset
+    // ReadChain computes [[[base] + 0x28] + 0x10] + 0x20 and returns that address (0 on a null pointer).
+    uintptr_t base = fb::GetModuleBase() + 0x1234567;  // address of the global pointer
 
     uintptr_t health_addr = fb::ReadChain(base, { 0x28, 0x10, 0x20 });
     if (health_addr)
@@ -406,7 +427,25 @@ void ManualAccess(void* raw_settings_ptr)
 
 ## SDK Architecture
 
-```
+Your DLL includes `SDK.h`, which pulls in three kinds of header:
+
+- `FBSDKTypes.h`, the `fb::` runtime utilities:
+  - `fb::GetModuleBase()`: cached game base address
+  - `fb::IsValidPtr()`: pointer range check
+  - `fb::Read<T>()` / `fb::Write<T>()`: fault-safe memory access
+  - `fb::ReadChain()`: follow Cheat Engine-style pointer paths
+  - `fb::PatternScan()`: IDA-style byte pattern scanner over the game module
+  - `fb::HookVFunc_InPlace()` / `fb::HookVFunc_Shadow()`: virtual function hooks
+  - `fb::Array<T>`, `fb::WeakPtr<T>`, `fb::String`: engine container stubs
+- `FBClasses.h`: forward declarations of every generated type.
+- One header per class, struct and enum, each with:
+  - `GetTypeInfo()`: ASLR-safe ClassInfo address
+  - `GetInstance()`: instance resolver (global singleton or pointer chain)
+  - `Offsets::FieldName`: compile-time offset constants
+  - `m_FieldName`: direct member access at the engine's offsets
+  - `Get/SetFieldName()`: typed accessors
+
+```text
 Your DLL
   │
   ├── #include "SDK.h"           ← master include
@@ -418,13 +457,14 @@ Your DLL
   │     │     ├── fb::Write<T>()         — safe memory write
   │     │     ├── fb::ReadChain()        — follow pointer chains
   │     │     ├── fb::PatternScan()      — AOB pattern scanner
-  │     │     └── Array<T>               — Frostbite array stub
+  │     │     ├── fb::HookVFunc_*()      — vtable hooks
+  │     │     └── fb::Array<T>           — Frostbite array stub
   │     │
   │     ├── FBClasses.h          ← forward declarations
   │     │
   │     └── [ClassName].h ...    ← one header per class/struct/enum
   │           ├── GetTypeInfo()          — ASLR-safe ClassInfo address
-  │           ├── GetInstance()          — singleton resolver (DataContainer only)
+  │           ├── GetInstance()          — instance resolver
   │           ├── Offsets::FieldName     — compile-time offset constants
   │           ├── m_FieldName            — direct member access (layout-correct)
   │           └── Get/SetFieldName()     — typed accessors
@@ -435,18 +475,23 @@ Your DLL
 
 ### How Instance Resolution Works
 
-```
-1. GetInstance() is called
-2. Computes ClassInfo address:  fb::GetModuleBase() + relative_offset
-3. Reads instance pointer:      *(void**)(classInfo + discovered_offset)
-4. Validates the pointer:       fb::IsValidPtr(instance)
-5. Returns typed pointer:       static_cast<GameSettings*>(instance)
+While generating, FrostbiteGen:
+
+1. Finds the root game context through a known per-game offset or a code pattern, and **confirms its class from its vtable** (the `GetType()` virtual function). If the class can't be confirmed, it explores the object without assuming a layout, and the generated code carries a warning.
+2. Follows pointer fields (and the first element of pointer arrays) from that root, recording the chain of offsets that reaches each class.
+3. Scans the game's writable data for global singletons: pointers to heap objects, and objects stored directly in the executable.
+
+`GetInstance()` then replays the shortest chain it recorded:
+
+```cpp
+uintptr_t ctx = fb::Read<uintptr_t>(fb::GetModuleBase() + 0x2401CB0); // ClientGameContext
+if (!ctx) return nullptr;
+ctx = fb::Read<uintptr_t>(ctx + 0x60); // PlayerManager
+if (!ctx) return nullptr;
+return reinterpret_cast<ClientPlayerManager*>(ctx);
 ```
 
-The `discovered_offset` is found automatically at SDK generation time by probing
-the ClassInfo structures of all DataContainer classes. The generator looks for a
-consistent offset that contains a valid heap pointer (with an in-module vtable)
-across many DataContainer types.
+For a class with many live instances, `GetInstance()` returns the one that was reached during generation (for example element 0 of an array), not a unique singleton.
 
 ### Three Ways to Access a Member
 
@@ -466,18 +511,19 @@ The pattern scan for the ClassInfo linked list head failed. This can happen if:
 - The game hasn't fully initialized yet — wait until you're at the main menu
 - The game version doesn't match the hardcoded pattern — update the pattern in `structs.h` → `ClassInfo::GetInstance()`
 
-### Instance offset not discovered
+### Root context not found or not verified
 
 Check `fbgen.txt` for:
-```
-WARNING: Could not reliably discover instance offset.
+```text
+WARNING: Root singleton not found - instance resolution will be limited
+WARNING: the root object's class could not be confirmed from its vtable; using blind traversal
 ```
 
-This means the probing heuristic didn't find a consistent offset. Possible causes:
-- The game was at a loading screen (instances not yet allocated)
-- The engine version stores instances differently
+Possible causes:
+- The game was at a loading screen (objects not yet allocated). Inject while in-game or at the main menu.
+- The game version is not one of the known executables, or a patch moved the root pointer. Add the offset for your executable to `FindClientGameContext()` in `classinfo.cpp`.
 
-**Fix:** Inject while in-game (not at a loading screen), or manually set `m_instanceOffset` in the `ClassInfoManager` constructor if you know the offset from reverse engineering.
+Global singletons are still found independently, so many classes keep a working `GetInstance()` either way.
 
 ### GetInstance() returns nullptr
 
@@ -501,8 +547,24 @@ This is handled automatically. All generated addresses use `fb::GetModuleBase() 
 ### Game crashes on injection
 
 - Make sure you're building for **x64** (`-A x64` in CMake)
-- Make sure `/EHa` is enabled (required for `__try/__except`)
+- Make sure `/EHa` is enabled, so C++ destructors run when a `__try/__except` in the SDK catches a fault
 - Avoid calling `GetInstance()` too early — add a `Sleep()` in `DllMain` or use a separate thread
+
+### "SDK generated with errors"
+
+`fbgen.txt` has an `ERROR:` line for each problem: a file that could not be written (read-only folder, path too long, two type names that differ only by case) or a type that was skipped after a memory fault. Everything else was still generated.
+
+---
+
+## Running the Tests
+
+`tests/run_sdk_test.sh` checks the generator end to end on Linux, without the game or MSVC. It runs the generator against a small fake engine (`tests/fake_engine.h`), compiles the generated SDK with `FBGEN_VERIFY_LAYOUT` enabled, checks that every `GetInstance()` returns the right object, and checks that the IDA/Ghidra scripts, JSON and Cheat Engine outputs parse.
+
+```bash
+tests/run_sdk_test.sh          # needs g++ (C++17) and python3
+```
+
+CI runs this on every pull request, builds `FrostbiteGen.dll` with MSVC, and compiles the generated SDK with MSVC.
 
 ---
 

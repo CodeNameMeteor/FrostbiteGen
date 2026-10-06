@@ -2,11 +2,13 @@
 #include "structs.h"
 #include "classinfo.h"
 
-char g_szLogFile[MAX_PATH]; 
+char g_szLogFile[MAX_PATH];
 char g_szBaseDir[MAX_PATH];
 
+static std::ofstream g_logStream;
+
 /// <summary>
-/// Datas the compare.
+/// Compares memory against a byte pattern; 'x' in the mask means "must match", anything else is a wildcard.
 /// </summary>
 bool DataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)
 {
@@ -21,7 +23,26 @@ bool DataCompare(const BYTE* pData, const BYTE* bMask, const char* szMask)
 }
 
 /// <summary>
-/// Finds the pattern.
+/// Scans one readable run for the pattern. Returns the match address or 0 (also on fault).
+/// </summary>
+static DWORD_PTR ScanRun(DWORD_PTR start, DWORD_PTR len, const BYTE* bMask, const char* szMask, size_t maskLen)
+{
+	__try
+	{
+		DWORD_PTR maxScan = len - maskLen;
+		for (DWORD_PTR i = 0; i <= maxScan; i++)
+		{
+			if (DataCompare((BYTE*)(start + i), bMask, szMask))
+				return start + i;
+		}
+	}
+	__except (FBGEN_AV_FILTER) {}
+	return 0;
+}
+
+/// <summary>
+/// Finds the first match of a masked byte pattern in [dwAddress, dwAddress + dwLen).
+/// Only committed, readable pages are scanned, so protected or packed images cannot crash the game.
 /// </summary>
 DWORD_PTR FindPattern(DWORD_PTR dwAddress, DWORD_PTR dwLen, DWORD_PTR offset, bool deref, BYTE *bMask, char * szMask)
 {
@@ -29,33 +50,36 @@ DWORD_PTR FindPattern(DWORD_PTR dwAddress, DWORD_PTR dwLen, DWORD_PTR offset, bo
 	if (maskLen == 0 || dwLen < maskLen)
 		return 0;
 
-	DWORD_PTR maxScan = dwLen - maskLen;
-	for (DWORD_PTR i = 0; i <= maxScan; i++)
+	for (const auto& run : GetReadableRuns(dwAddress, dwAddress + dwLen))
 	{
-		if (DataCompare((BYTE*)(dwAddress + i), bMask, szMask))
+		if (run.second - run.first < maskLen)
+			continue;
+
+		DWORD_PTR match = ScanRun(run.first, run.second - run.first, bMask, szMask, maskLen);
+		if (!match)
+			continue;
+
+		if (deref)
 		{
-			if (deref)
-			{
-				void* derefAddr = *(void**)(dwAddress + i + offset);
-				if (!derefAddr)
-					return 0;
-				DWORD_PTR dwOut = 0;
-				memcpy(&dwOut, derefAddr, 4);
-				return dwOut;
-			}
-			return (DWORD_PTR)(dwAddress + i + offset);
+			void* derefAddr = SafeReadPointer(match + offset);
+			if (!derefAddr)
+				return 0;
+			DWORD_PTR dwOut = 0;
+			if (!SafeReadBytes((uintptr_t)derefAddr, &dwOut, 4))
+				return 0;
+			return dwOut;
 		}
+		return (DWORD_PTR)(match + offset);
 	}
 	return 0;
 }
 
 /// <summary>
-/// Logs the specified sz text.
+/// Appends a timestamped line to the log file. The file is opened once and kept open.
 /// </summary>
 void Log(const char* szText, ...)
 {
 	va_list		va_alist;
-	std::ofstream	fout;
 	char		buf[1024];
 
 	va_start(va_alist, szText);
@@ -63,12 +87,11 @@ void Log(const char* szText, ...)
 	buf[sizeof(buf) - 1] = '\0';
 	va_end(va_alist);
 
-	fout.open(g_szLogFile, std::ios::app);
-
-	if (fout.fail())
+	if (!g_logStream.is_open())
 	{
-		fout.close();
-		return;
+		g_logStream.open(g_szLogFile, std::ios::app);
+		if (!g_logStream.is_open())
+			return;
 	}
 
 	time_t rawtime;
@@ -80,12 +103,18 @@ void Log(const char* szText, ...)
 	char szTime[64];
 	snprintf(szTime, sizeof(szTime), "[%02d:%02d:%02d] ", ti.tm_hour, ti.tm_min, ti.tm_sec);
 
-	fout << szTime << buf << std::endl;
-	fout.close();
+	// std::endl flushes, so the log survives if the game crashes mid-generation.
+	g_logStream << szTime << buf << std::endl;
+}
+
+void CloseLog()
+{
+	if (g_logStream.is_open())
+		g_logStream.close();
 }
 
 /// <summary>
-/// Gets the dir file.
+/// Builds a path relative to the DLL's directory.
 /// </summary>
 void GetDirFile(const char* file, char* out, size_t len)
 {
@@ -98,6 +127,7 @@ void GetDirFile(const char* file, char* out, size_t len)
 DWORD WINAPI GeneratorThread(LPVOID lpParam)
 {
 	HMODULE hModule = (HMODULE)lpParam;
+	const UINT boxFlags = MB_SETFOREGROUND | MB_TOPMOST;
 
 	if (GetModuleFileNameA(hModule, g_szBaseDir, sizeof(g_szBaseDir)))
 	{
@@ -117,31 +147,64 @@ DWORD WINAPI GeneratorThread(LPVOID lpParam)
 	fout.close();
 
 	Log("FrostbiteGen SDK Generator starting...");
-	Log("Module base: 0x%016llX", (uintptr_t)GetModuleHandle(NULL));
+	Log("Module base: 0x%016llX", (unsigned long long)(uintptr_t)GetModuleHandle(NULL));
 
 	char sdkPath[MAX_PATH];
 	GetDirFile("SDK\\", sdkPath, sizeof(sdkPath));
 	DWORD dwAttr = GetFileAttributes(sdkPath);
 	if (dwAttr == INVALID_FILE_ATTRIBUTES)
-		CreateDirectory(sdkPath, NULL);
+	{
+		if (!CreateDirectory(sdkPath, NULL))
+		{
+			Log("ERROR: Could not create output directory %s", sdkPath);
+			char msg[MAX_PATH + 128];
+			snprintf(msg, sizeof(msg), "Could not create the output folder:\n%s\n\nMove FrostbiteGen.dll to a writable folder and inject again.", sdkPath);
+			MessageBox(0, msg, "FrostbiteGen", MB_ICONERROR | boxFlags);
+			CloseLog();
+			FreeLibraryAndExitThread(hModule, 1);
+			return 1;
+		}
+	}
+	else if (!(dwAttr & FILE_ATTRIBUTE_DIRECTORY))
+	{
+		Log("ERROR: %s exists but is not a directory", sdkPath);
+		MessageBox(0, "An 'SDK' file is in the way of the output folder next to FrostbiteGen.dll.", "FrostbiteGen", MB_ICONERROR | boxFlags);
+		CloseLog();
+		FreeLibraryAndExitThread(hModule, 1);
+		return 1;
+	}
 
 	ClassInfo* classInfo = ClassInfo::GetInstance();
 	if (!classInfo)
 	{
 		Log("ERROR: Failed to find ClassInfo instance");
-		MessageBox(0, "Failed to find ClassInfo", "FrostbiteGen", MB_ICONERROR);
+		char msg[MAX_PATH + 160];
+		snprintf(msg, sizeof(msg), "Failed to find the engine's type list (ClassInfo).\n\nWait until the game reaches the main menu and inject again.\nLog: %s", g_szLogFile);
+		MessageBox(0, msg, "FrostbiteGen", MB_ICONERROR | boxFlags);
+		CloseLog();
 		FreeLibraryAndExitThread(hModule, 1);
 		return 1;
 	}
 
-	Log("ClassInfo head: 0x%016llX", (uintptr_t)classInfo);
+	Log("ClassInfo head: 0x%016llX", (unsigned long long)(uintptr_t)classInfo);
 
-	ClassInfoManager manager(classInfo);
-	manager.BuildClassList();
-	manager.DumpClasses();
+	bool hadErrors = false;
+	std::string summary;
+	{
+		ClassInfoManager manager(classInfo);
+		manager.BuildClassList();
+		manager.DumpClasses();
+		hadErrors = manager.HasErrors();
+		summary = manager.GetSummary();
+	}
 
-	Log("SDK generation complete!");
-	MessageBox(0, "SDK generated successfully!\nCheck the SDK\\ folder for output.", "FrostbiteGen", MB_ICONINFORMATION);
+	Log("SDK generation complete: %s", summary.c_str());
+	CloseLog();
+
+	std::string msg = std::string(hadErrors ? "SDK generated with errors.\n" : "SDK generated successfully!\n")
+		+ summary + "\n\nOutput: " + g_szBaseDir + "SDK\\\nLog: " + g_szLogFile;
+	MessageBeep(hadErrors ? MB_ICONWARNING : MB_ICONINFORMATION);
+	MessageBox(0, msg.c_str(), "FrostbiteGen", (hadErrors ? MB_ICONWARNING : MB_ICONINFORMATION) | boxFlags);
 
 	// Automatically unload the DLL to release disk locks and allow immediate recompilation
 	FreeLibraryAndExitThread(hModule, 0);
